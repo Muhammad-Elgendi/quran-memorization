@@ -390,14 +390,17 @@ audio: file (required)
 
 Enable CORS for local Vite (`http://localhost:5173`) and configurable origins. Phase 1 may use `*` for local development.
 
-### 11.5 Future endpoints (document only; do not implement in Phase 1)
+### 11.5 Future endpoints / Phase 2 stream
 
 ```text
-POST /api/memorization/assess-range   # multi-ayah
-WS   /api/memorization/stream         # chunked live feedback
-GET  /api/sessions/{id}
-GET  /api/progress
+POST /api/memorization/assess-range   # multi-ayah (not yet)
+WS   /api/memorization/stream         # Phase 2 continuous session — see specs/realtime-stream-spec.md
+GET  /api/sessions/{id}               # not yet
+GET  /api/progress                    # not yet
 ```
+
+`WS /api/memorization/stream` is implemented (PCM s16le @ 16 kHz, silence segmentation,
+auto-advance). Authoritative protocol: `specs/realtime-stream-spec.md`.
 
 ---
 
@@ -568,8 +571,10 @@ cd frontend && npm install && npm run dev
 
 ### Phase 2 — Real-time trainer
 
-- [ ] WebSocket (or chunked upload) streaming STT
-- [ ] Incremental alignment; immediate tone + highlight on mismatch
+- [x] WebSocket streaming STT (`WS /api/memorization/stream`, PCM + silence VAD)
+- [x] Ayah-final alignment + auto-advance; Vue continuous mode
+- [ ] Incremental partials UX (supported but default off for CPU)
+- [ ] Leftover transcript carry for pause-less tilawah
 - [ ] Session + progress persistence
 
 ### Phase 3 — Quran-tuned ASR

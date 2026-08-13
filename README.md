@@ -1,17 +1,17 @@
 # Quran Memorization Assessor
 
-Local-first Quran memorization practice tool: select an ayah, recite into the microphone, and receive a score with word-level feedback.
+Local-first Quran memorization practice tool: select an ayah, recite into the microphone, and receive a score with word-level feedback. Use **Single ayah** (REST upload) or **continuous** mode (WebSocket, auto-advance).
 
-The **FastAPI backend** owns corpus serving, speech-to-text (Moonshine Arabic Tiny), Arabic normalization, and assessment. The **Vue** client is one consumer of the same REST API (Flutter can call the same endpoints later).
+The **FastAPI backend** owns corpus serving, speech-to-text (Moonshine Arabic Tiny), Arabic normalization, and assessment. The **Vue** client is one consumer of the same API (Flutter can call the same endpoints later).
 
 ## Architecture
 
 ```text
-Browser (Vue)  --REST-->  FastAPI  -->  Quran JSON
-                              |
-                              +-->  Moonshine Arabic Tiny (Transformers)
-                              |
-                              +-->  Normalizer + sequence-aligned assessor
+Browser (Vue)  --REST /assess-->  FastAPI  -->  Quran JSON
+       |                              |
+       +--WS /stream (PCM)------------+-->  Moonshine Arabic Tiny
+                                      |
+                                      +-->  Normalizer + sequence-aligned assessor
 ```
 
 ## Requirements
@@ -63,7 +63,7 @@ cd frontend && npm install && npm run dev
 - App: http://localhost:5173  
 - API docs: http://localhost:8000/docs  
 
-## REST API (Flutter-ready)
+## API (Flutter-ready)
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -72,8 +72,9 @@ cd frontend && npm install && npm run dev
 | `GET` | `/api/quran/surahs/{id}` | Full surah |
 | `GET` | `/api/quran/surahs/{id}/ayahs/{ayahId}` | Single ayah |
 | `POST` | `/api/memorization/assess` | `multipart`: `surah`, `ayah`, optional `threshold`, `audio` |
+| `WS` | `/api/memorization/stream` | Continuous session: JSON control + PCM audio |
 
-Clients send audio + target ayah; they do **not** implement Arabic normalization or scoring.
+Clients send audio + target ayah; they do **not** implement Arabic normalization or scoring. Stream protocol: [`specs/realtime-stream-spec.md`](specs/realtime-stream-spec.md).
 
 ## Tests
 
@@ -108,11 +109,13 @@ See [`k8s/README.md`](k8s/README.md) for kind/minikube notes. PVCs hold the Qura
 - Word mismatch threshold: **75%**
 - Assessment uses `rapidfuzz` overall similarity plus `difflib.SequenceMatcher` token alignment
 - Failed assessments play a short warning tone in the UI
-- Phase 1 is REST-only (no streaming WebSocket yet)
+- Continuous mode streams **16 kHz PCM** (AudioWorklet); silence ends an ayah attempt; partials are **off by default** for CPU
+- Vite proxy and nginx/Ingress support WebSocket upgrade for `/api`
 
 ## Specs
 
-- [`implementation-spec.md`](implementation-spec.md) — authoritative Phase 1 guide
-- [`first-spec.md`](first-spec.md) — source notes
-- [`docs/agent-context.md`](docs/agent-context.md) — full build-session context for humans and later AI prompts (architecture, runbooks, incident fixes)
+- [`specs/implementation-spec.md`](specs/implementation-spec.md) — Phase 1 REST guide
+- [`specs/realtime-stream-spec.md`](specs/realtime-stream-spec.md) — Phase 2 WebSocket protocol
+- [`specs/first-spec.md`](specs/first-spec.md) — source notes
+- [`docs/agent-context.md`](docs/agent-context.md) — full build-session context for humans and later AI prompts
 - Cursor rules in [`.cursor/rules/`](.cursor/rules/) — auto-applied project guidance

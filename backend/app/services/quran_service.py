@@ -61,3 +61,39 @@ class QuranService:
             for ayah in surah["ayahs"]
             if start_ayah <= ayah["number"] <= end_ayah
         ]
+
+    def last_ayah_number(self, surah_number: int) -> Optional[int]:
+        surah = self.get_surah(surah_number)
+        if not surah or not surah["ayahs"]:
+            return None
+        return int(surah["ayahs"][-1]["number"])
+
+    def next_ayah(
+        self,
+        surah_number: int,
+        ayah_number: int,
+        *,
+        cross_surah: bool = False,
+    ) -> Optional[tuple[int, int]]:
+        last = self.last_ayah_number(surah_number)
+        if last is None:
+            return None
+        if ayah_number < last:
+            return surah_number, ayah_number + 1
+        if not cross_surah:
+            return None
+        ordered = sorted(self.data, key=lambda s: s["number"])
+        for idx, surah in enumerate(ordered):
+            if surah["number"] != surah_number:
+                continue
+            if idx + 1 >= len(ordered):
+                return None
+            nxt = ordered[idx + 1]
+            if not nxt.get("ayahs"):
+                return None
+            return int(nxt["number"]), int(nxt["ayahs"][0]["number"])
+        return None
+
+    @staticmethod
+    def corpus_order(surah: int, ayah: int) -> tuple[int, int]:
+        return (surah, ayah)

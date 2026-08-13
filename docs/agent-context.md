@@ -2,13 +2,17 @@
 
 **Purpose:** Persist implementation knowledge from the initial build session so later prompts start with correct architecture, runbooks, and known fixes.
 
-**Authoritative product spec:** `implementation-spec.md` (prefer over `first-spec.md` when they differ).
+**Authoritative product specs:**
+- Phase 1 REST: `specs/implementation-spec.md`
+- Phase 2 stream: `specs/realtime-stream-spec.md`
 
-**Last updated:** 2026-08-13 (audio WebM decode session)
+**Last updated:** 2026-08-13 (Phase 2 WebSocket continuous stream)
 
 ---
 
-## 1. What was built (Phase 1 MVP)
+## 1. What was built
+
+### Phase 1 MVP (REST)
 
 Local-first Quran memorization assessor:
 
@@ -18,7 +22,17 @@ Local-first Quran memorization assessor:
 4. Arabic **normalization** (comparison only) + **sequence-aligned** scoring vs canonical Uthmani text.
 5. Returns score, pass/fail, missing/extra/wrong words; UI plays a ~660 Hz warning tone on fail.
 
-**Out of scope (Phase 1):** streaming/WebSocket, tajweed scoring, accounts/progress, Flutter client (API is ready for it), Quran-fine-tuned ASR.
+### Phase 2 (WebSocket continuous)
+
+1. `WS /api/memorization/stream` — long-lived session with JSON control + binary PCM.
+2. Client streams **pcm_s16le @ 16 kHz mono** via AudioWorklet (no Opus encode on the hot path).
+3. Server uses energy VAD + silence (≥800 ms) to finalize utterances; `ayah.force_assess` / skip escape hatches.
+4. Reuses `SpeechRecognizer.transcribe_audio`, `MemorizationAssessor`, `QuranService`.
+5. Auto-advance on pass; UI fail policies: **continue** | **stop** (server also supports `retry`).
+6. **Partials default OFF** (`STREAM_PARTIALS_DEFAULT=false`) to keep CPU light; when enabled, gated + 2 s cadence + last-3 s window.
+7. Vue mode toggle: Single ayah (REST) vs Continuous (WS).
+
+**Still out of scope:** tajweed, accounts/progress DB, Quran-fine-tuned ASR, leftover-carry for pause-less tilawah (v1.1), multi-replica sticky sessions.
 
 ---
 
@@ -28,35 +42,36 @@ Local-first Quran memorization assessor:
 quran-memorization/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py              # FastAPI, CORS, routers, /health
-│   │   ├── config.py            # pydantic-settings
-│   │   ├── api/quran.py         # GET surahs / surah / ayah
-│   │   ├── api/memorization.py  # POST assess (multipart)
+│   │   ├── main.py                    # FastAPI, CORS, routers, /health
+│   │   ├── config.py                  # pydantic-settings (+ STREAM_* knobs)
+│   │   ├── api/quran.py               # GET surahs / surah / ayah
+│   │   ├── api/memorization.py        # POST assess (multipart)
+│   │   ├── api/memorization_stream.py # WS /api/memorization/stream
 │   │   ├── models/schemas.py
 │   │   └── services/
 │   │       ├── quran_service.py
-│   │       ├── speech_service.py  # SpeechRecognizer ABC + Moonshine
-│   │       ├── audio.py           # ffmpeg→WAV when soundfile can't open upload
+│   │       ├── speech_service.py      # SpeechRecognizer + transcribe_audio
+│   │       ├── audio.py               # ffmpeg→WAV for REST uploads
+│   │       ├── stream_audio.py        # PCM ring + energy VAD
+│   │       ├── stream_session.py      # session state machine
 │   │       ├── normalizer.py
-│   │       └── assessor.py        # rapidfuzz + SequenceMatcher
-│   ├── data/quran.json          # generated; gitignored
-│   ├── download_quran.py        # HF download + Fatihah repair
+│   │       └── assessor.py
+│   ├── data/quran.json
+│   ├── download_quran.py
 │   ├── requirements.txt
 │   ├── Dockerfile
-│   └── tests/
-├── frontend/                    # Vue 3 + Vite + axios
-│   ├── Dockerfile               # multi-stage → nginx
-│   └── nginx.conf               # proxies /api and /health → backend:8000
-├── docker/backend-entrypoint.sh
-├── docker-compose.yml           # prod-like local
-├── docker-compose.dev.yml       # hot reload
-├── k8s/deploy.yaml
-├── install.py
-├── README.md
-├── docs/agent-context.md        # this file
-├── .cursor/rules/               # Cursor rules for later prompts
-├── implementation-spec.md
-└── first-spec.md
+│   └── tests/                         # test_core.py + test_stream.py
+├── frontend/                          # Vue 3 + Vite + axios
+│   ├── public/pcm-worklet.js          # 16 kHz PCM capture worklet
+│   ├── src/stream.js                  # WS URL + PCM capture helper
+│   ├── src/App.vue                    # single + continuous modes
+│   ├── Dockerfile
+│   └── nginx.conf                     # /api proxy + WebSocket upgrade
+├── specs/realtime-stream-spec.md
+├── specs/implementation-spec.md
+├── docs/agent-context.md
+├── k8s/deploy.yaml                    # WS-friendly ingress timeouts
+└── …
 ```
 
 ---
@@ -67,10 +82,11 @@ quran-memorization/
 |---|-----------|
 | 1 | Never compare raw Quran strings; always normalize copies only |
 | 2 | Never write normalized text back to `quran.json` |
-| 3 | STT behind `SpeechRecognizer.transcribe(path) -> str` |
+| 3 | STT behind `SpeechRecognizer` (`transcribe` / `transcribe_audio`) — no model imports in routers |
 | 4 | Backend owns assessment; clients are thin |
-| 5 | Phase 1 transport is **REST only** |
+| 5 | Phase 1 REST `/assess` and Phase 2 WS `/stream` coexist |
 | 6 | Religious text must be verified vs trusted Uthmani (e.g. Tanzil / nuqayah/quran-text) before production |
+| 7 | Stream path prefers PCM @ 16 kHz; partials off by default for CPU |
 
 ---
 
@@ -83,10 +99,13 @@ quran-memorization/
 | GET | `/api/quran/surahs/{id}` | Full surah + `ayahs[{number,text}]` |
 | GET | `/api/quran/surahs/{id}/ayahs/{ayahId}` | Single ayah |
 | POST | `/api/memorization/assess` | multipart: `surah`, `ayah`, `threshold?`, `audio` |
+| WS | `/api/memorization/stream` | continuous session; see `specs/realtime-stream-spec.md` |
 
 Assess success JSON includes: `score`, `passed`, `warning`, `expected`, `recognized`, `missing_words`, `extra_words`, `wrong_words`, `message`, `alignment`.
 
-Defaults: overall threshold **0.85**, word mismatch **0.75**, audio **0.5–20s**, max upload **5MB**.
+Stream: client sends `session.start` then binary PCM chunks; server emits `session.ready`, `ayah.result`, `session.advance`, `session.summary`. Partials default **false**.
+
+Defaults: overall threshold **0.85**, word mismatch **0.75**, audio **0.5–20s** (REST), max upload **5MB**.
 
 ---
 

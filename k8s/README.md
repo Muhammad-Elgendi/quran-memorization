@@ -10,3 +10,7 @@
 #
 # Point /etc/hosts (or your DNS) at the ingress IP for quran.local,
 # or use: kubectl -n quran-memorization port-forward svc/frontend 8080:80
+#
+# WebSocket: Ingress and frontend nginx both enable Upgrade/Connection for
+# /api/memorization/stream. Keep backend replicas=1 (or sticky sessions)
+# while session state is in-memory.

@@ -22,6 +22,13 @@ data:
   PREFETCH_MODEL: "1"
   HF_HOME: "/models/huggingface"
   TRANSFORMERS_CACHE: "/models/huggingface"
+  # Phase 2 stream (CPU-light defaults)
+  STREAM_PARTIALS_DEFAULT: "false"
+  STREAM_PARTIAL_EVERY_MS: "2000"
+  STREAM_SILENCE_MS: "800"
+  STREAM_IDLE_TIMEOUT_S: "60"
+  STREAM_MAX_SESSION_S: "1800"
+  STREAM_MAX_CONCURRENT_SESSIONS: "2"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -178,7 +185,13 @@ metadata:
   annotations:
     # Adjust for your ingress controller (nginx example).
     nginx.ingress.kubernetes.io/proxy-body-size: "6m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # WebSocket upgrade for /api/memorization/stream (via frontend nginx → backend).
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection $connection_upgrade;
 spec:
   ingressClassName: nginx
   rules:

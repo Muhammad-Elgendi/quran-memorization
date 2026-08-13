@@ -27,6 +27,20 @@ class Settings(BaseSettings):
 
     MOONSHINE_MODEL: str = "UsefulSensors/moonshine-tiny-ar"
 
+    # Realtime WebSocket stream (Phase 2) — tuned for low CPU.
+    STREAM_SILENCE_MS: int = 800
+    STREAM_MIN_UTTERANCE_MS: int = 400
+    STREAM_PARTIAL_EVERY_MS: int = 2000
+    STREAM_COVERAGE_THRESHOLD: float = 0.85
+    STREAM_OVERLAP_MS: int = 300
+    STREAM_IDLE_TIMEOUT_S: int = 60
+    STREAM_MAX_SESSION_S: int = 1800
+    STREAM_MAX_BUFFER_S: float = 45.0
+    STREAM_MAX_FRAME_BYTES: int = 256 * 1024
+    STREAM_MAX_CONCURRENT_SESSIONS: int = 2
+    STREAM_PARTIALS_DEFAULT: bool = False
+    STREAM_VAD_RMS_THRESHOLD: float = 0.015
+
     # NoDecode: env values like "*" or "a,b" must not be JSON-parsed first.
     CORS_ORIGINS: Annotated[list[str], NoDecode] = ["*"]
 
