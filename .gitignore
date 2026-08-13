@@ -20,3 +20,4 @@ backend/data/quran.json
 *.wav
 hf_cache/
 .cache/
+.talismanrc
