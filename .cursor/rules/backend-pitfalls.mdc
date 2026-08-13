@@ -1,0 +1,36 @@
+---
+description: Backend pitfalls — CORS, corpus Fatihah, WebM/ffmpeg audio, assess API
+globs: backend/**/*
+alwaysApply: false
+---
+
+# Backend conventions & known pitfalls
+
+## Config (`app/config.py`)
+
+- `CORS_ORIGINS` is `Annotated[list[str], NoDecode]` so env `CORS_ORIGINS=*` works.
+- Without `NoDecode`, pydantic-settings JSON-parses `*` and crashes the container.
+
+## Corpus (`download_quran.py`)
+
+- HF `arbml/quran_uthmani` omits Al-Fatihah ayah 1 (Bismillah).
+- Always `ensure_fatihah_complete`; entrypoint runs `--repair` when file exists.
+- After repair: **114 surahs, 6236 ayahs**. Lookup by **ayah number**, not list index.
+
+## Audio decode (`services/audio.py`) — WebM pitfall
+
+- Browser MVP uploads **`audio/webm`** (MediaRecorder / Opus).
+- Librosa **1.x** uses **soundfile only** (no audioread fallback) → WebM fails with `Format not recognised`.
+- That became assess **`400 Invalid audio file`**.
+- Always run uploads through `prepare_audio()` (ffmpeg → mono 16 kHz WAV when needed) before `get_duration` / STT.
+- Keep **ffmpeg** in the Docker image. Do not assume `librosa.load` reads WebM.
+
+## Assess API (`POST /api/memorization/assess`)
+
+Multipart: `surah`, `ayah`, optional `threshold` (0.5–1.0), `audio` (webm/wav/ogg/mp3/m4a/flac).
+Enforce duration + `MAX_UPLOAD_BYTES`. Delete upload temp **and** converted wav in `finally`.
+Empty transcript → fail (200); model load failure → 503.
+
+## Tests
+
+Fixture corpus + `MockSpeechRecognizer`. `test_assess_webm_via_ffmpeg` needs container/host ffmpeg with libopus.

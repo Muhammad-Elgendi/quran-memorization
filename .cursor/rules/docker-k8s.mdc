@@ -1,0 +1,35 @@
+---
+description: Docker Compose, nginx proxy, and Kubernetes deployment notes
+globs: "{docker-compose*.yml,docker/**,**/Dockerfile,frontend/nginx.conf,k8s/**}"
+alwaysApply: false
+---
+
+# Docker & Kubernetes
+
+## Compose
+
+- `docker-compose.yml`: backend + nginx frontend; volumes `quran_data`, `hf_cache`.
+- `docker-compose.dev.yml`: bind-mount backend + Vite; proxy via `VITE_PROXY_TARGET=http://backend:8000`.
+- Frontend nginx proxies `/api/` and `/health` to `http://backend:8000` (Service name must be `backend` in K8s too).
+- `PREFETCH_MODEL=1` downloads Moonshine at container start (~112MB into `hf_cache`).
+- Nginx may log “request body buffered to temporary file” on assess uploads — normal, not the failure.
+
+## Entrypoint (`docker/backend-entrypoint.sh`)
+
+1. If no `data/quran.json` → full download.
+2. Else → `python download_quran.py --repair` (fixes Fatihah on old volumes).
+3. Optional model prefetch, then `exec` CMD.
+
+## K8s (`k8s/deploy.yaml`)
+
+Namespace `quran-memorization`; ConfigMap `backend-config`; PVCs for Quran data + HF cache; Ingress host `quran.local`. Build/load images then `kubectl apply -f k8s/deploy.yaml`. See `k8s/README.md`.
+
+## Rebuild reminder
+
+Image code is not live-reloaded in prod compose. After fixing Python/Vue: `docker compose up --build`. Corpus repairs on volume persist across recreates; wipe with `docker compose down -v` only if intentional.
+
+Hot-copying files into a running container is temporary — always rebuild so the next recreate keeps the fix.
+
+## Audio in containers
+
+Backend image must keep `ffmpeg` + `libsndfile1`. Browser assess sends WebM; without ffmpeg conversion (`services/audio.py`) assess returns 400 Invalid audio file.

@@ -1,0 +1,36 @@
+:root {
+  color-scheme: light;
+  --bg: #f4f6f3;
+  --surface: #ffffff;
+  --ink: #1c2a22;
+  --muted: #5a6b60;
+  --accent: #1f6b4a;
+  --accent-soft: #dcefe5;
+  --fail: #8b2e2e;
+  --fail-soft: #f7e1e1;
+  --pass: #1f6b4a;
+  --pass-soft: #dcefe5;
+  --border: #d5ddd7;
+  --shadow: 0 12px 40px rgba(28, 42, 34, 0.08);
+  font-family: "Segoe UI", "Noto Naskh Arabic", "Amiri", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top left, #e7f2eb 0%, transparent 45%),
+    radial-gradient(circle at bottom right, #eef1e8 0%, transparent 40%),
+    var(--bg);
+}
+
+button,
+select,
+input {
+  font: inherit;
+}

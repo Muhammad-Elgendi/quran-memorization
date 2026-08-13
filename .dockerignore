@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+node_modules
+frontend/dist
+**/__pycache__
+**/.pytest_cache
+*.pyc
+.env
+backend/data/quran.json
+.first-spec.md
+implementation-spec.md
+k8s
+*.md
+!README.md

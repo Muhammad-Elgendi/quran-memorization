@@ -1,0 +1,1 @@
+"""Quran Memorization Assistant backend."""
