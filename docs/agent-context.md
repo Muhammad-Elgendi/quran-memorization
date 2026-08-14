@@ -6,7 +6,7 @@
 - Phase 1 REST: `specs/implementation-spec.md`
 - Phase 2 stream: `specs/realtime-stream-spec.md`
 
-**Last updated:** 2026-08-13 (Phase 2 WebSocket continuous stream)
+**Last updated:** 2026-08-14 (Continuous empty-0% / quiet-mic STT gate)
 
 ---
 
@@ -25,12 +25,19 @@ Local-first Quran memorization assessor:
 ### Phase 2 (WebSocket continuous)
 
 1. `WS /api/memorization/stream` — long-lived session with JSON control + binary PCM.
-2. Client streams **pcm_s16le @ 16 kHz mono** via AudioWorklet (no Opus encode on the hot path).
-3. Server uses energy VAD + silence (≥800 ms) to finalize utterances; `ayah.force_assess` / skip escape hatches.
+2. Client streams **pcm_s16le @ 16 kHz mono** via AudioWorklet (no Opus encode on the hot path). Shared capture graph supports neural denoise (default DTLN; AGC off when neural).
+3. Server uses energy VAD + dual silence (short ~400 ms coverage check, long ≥800 ms) to finalize; `ayah.force_assess` / skip escape hatches.
 4. Reuses `SpeechRecognizer.transcribe_audio`, `MemorizationAssessor`, `QuranService`.
 5. Auto-advance on pass; UI fail policies: **continue** | **stop** (server also supports `retry`).
-6. **Partials default OFF** (`STREAM_PARTIALS_DEFAULT=false`) to keep CPU light; when enabled, gated + 2 s cadence + last-3 s window.
+6. **Partials default ON** (`STREAM_PARTIALS_DEFAULT=true`) with unified completion probe (~1 s). Mid-utterance partials are **provisional** (UI does not lock red chips until `ayah.result`). Coverage auto-finalize needs `STREAM_COVERAGE_STABLE_TICKS` (default 2) consecutive high-coverage ticks.
 7. Vue mode toggle: Single ayah (REST) vs Continuous (WS).
+8. **STT confidence filter:** Moonshine `generate(..., output_scores=True)` → drop Heard words with **calibrated** decoder *P* below Accuracy *T* (default 0.85). Tiny softmax is mapped with `p ** STT_DECODER_PROB_GAMMA` (0.12) first — raw *P* ≥ 0.85 emptied real Fatihah. Sequence confidence below 0.50 dumps the whole decode. `transcribe()` still returns the filtered string.
+9. **Ayah-constrained Heard recovery** (after the confidence filter): agglutinated STT tokens like `بسمالله` are split against consecutive expected ayah words; dropped in-vocab words with confidence ≥ `STT_INVOCAB_FLOOR` (0.55) are revived in decode order. Expected remains corpus Uthmani; comparison still goes through the normalizer. Does **not** invent words that never appeared in the decode.
+10. **Energy gates (do not conflate):**
+    - `STREAM_VAD_RMS_THRESHOLD` (0.015) — speech vs silence for utterance boundaries.
+    - `STREAM_STT_RMS_THRESHOLD` (0.008) — whether periodic / auto STT is worth calling (quieter; AGC-off + denoise often sits under the VAD floor).
+    - **`ayah.force_assess` (Check now) always runs STT** when the buffer has ≥ `STREAM_MIN_UTTERANCE_MS` of audio — it does **not** use the energy short-circuit. Empty Heard → soft `error.code=no_speech` + `session.listening`, **not** `ayah.result` Score 0%.
+11. **Incomplete long silence** clears the ring buffer (no overlap) so a retry is not glued onto a failed take. Short silence with low coverage keeps the buffer and emits `session.listening`.
 
 **Still out of scope:** tajweed, accounts/progress DB, Quran-fine-tuned ASR, leftover-carry for pause-less tilawah (v1.1), multi-replica sticky sessions.
 
@@ -50,7 +57,8 @@ quran-memorization/
 │   │   ├── models/schemas.py
 │   │   └── services/
 │   │       ├── quran_service.py
-│   │       ├── speech_service.py      # SpeechRecognizer + transcribe_audio
+│   │       ├── speech_service.py      # SpeechRecognizer + scored Transcription
+│   │       ├── stt_confidence.py      # Heard word-keep filter + ayah lexicon recovery
 │   │       ├── audio.py               # ffmpeg→WAV for REST uploads
 │   │       ├── stream_audio.py        # PCM ring + energy VAD
 │   │       ├── stream_session.py      # session state machine
@@ -130,9 +138,19 @@ Implemented in `backend/app/services/normalizer.py`:
 
 - Overall `score = rapidfuzz.fuzz.ratio(norm_expected, norm_recognized) / 100`
 - Token alignment via `difflib.SequenceMatcher` (insert/delete/replace)
+- Replace pairs at/above word threshold (`WORD_MATCH_THRESHOLD=0.75`) → promoted to alignment `op: equal`
 - Replace pairs below word threshold → `wrong_words`
 - `passed = score >= threshold`; `warning = not passed`
 - Short phrases with one wrong word may still **pass** overall score at 0.85 while still listing `wrong_words` (spec scores overall ratio; UI shows mistakes)
+- **`progress()` / stream coverage gate** uses the **same** matched-token definition as alignment (exact `equal` **or** fuzzy replace ≥ word threshold), best over recognized suffixes. Do **not** revert coverage to exact-token-only — that stuck Continuous mode on Fatihah 1:2/1:4/1:6 when STT emitted simple Arabic vs Uthmani dagger-alef seats (`specs/ayah-advance-fix-spec.md`).
+- **Heard recovery** (`recover_against_ayah`) runs after the confidence filter and before `progress` / `assess` on REST and WS. A dropped `بسم` at conf 0.62 is revived; a Basmala that never decoded `بسم` stays at 75% coverage and does not auto-advance.
+
+### Follow-ups (not yet shipped)
+
+- **P1 — Comparison orthography:** store/compare against Tanzil Simple / Imlaei (`text_simple` beside Uthmani `text`); never overwrite `text`. Blind `U+0670 → ا` is wrong (breaks الرحمن). Shared with `specs/uthmani-tanzeel-word-matching-spec.md` §6.3.
+- **P1 — Heard projection:** optional `STT_HEARD_PROJECT_TO_CORPUS` (default off) to show Uthmani surfaces for matched Heard words.
+- **P2 — Leftover carry:** after a successful coverage finalize, pause-less tilawah may lose already-spoken ayah N+1 (`realtime-stream-spec.md` §8.2).
+- **P2 — Short-ayah pass integrity:** do not let `force_assess` pass a short ayah on character score alone when a full expected token was deleted.
 
 ---
 
@@ -153,10 +171,12 @@ Implemented in `backend/app/services/normalizer.py`:
 ## 8. Speech / Moonshine
 
 - Model: `UsefulSensors/moonshine-tiny-ar` (~112MB)
-- Lazy-load on first `transcribe`
+- Lazy-load into RAM on first `transcribe`; **disk prefetch** on Compose/K8s start
 - Audio for STT: mono 16 kHz float samples
-- HF cache: `/models/huggingface` (Compose volume `hf_cache`, K8s PVC)
-- First assess is slow until model downloads unless `PREFETCH_MODEL=1`
+- HF cache: `/models/huggingface` (`HF_HOME`), snapshots under `hub/` (`HF_HUB_CACHE`)
+- Compose: named volume `hf_cache`; service `model-prefetch` runs `prefetch_model.py` before backend
+- K8s: PVC `hf-model-cache`; initContainer `prefetch-stt-model` (skip-if-cached)
+- Do **not** set `TRANSFORMERS_CACHE` to the same path as `HF_HOME` (cache-layout mismatch → re-download)
 - Unauthenticated HF Hub warning in logs is noisy but OK if model is already cached
 
 ---
@@ -214,6 +234,8 @@ docker compose exec backend bash -c '
 | `CORS_ORIGINS=*` | Must use `NoDecode` on `list[str]` field or pydantic-settings JSON-parses `*` and **crashes on startup** |
 | `QURAN_PATH` | Relative to backend root → `data/quran.json` |
 | Compose `CORS_ORIGINS: "*"` | Valid only after NoDecode fix |
+| `STT_AYAH_LEXICON_RECOVERY` | After the confidence filter; `false` rolls back to filter-only Heard |
+| `STT_INVOCAB_FLOOR` | Min post-calibration conf to revive a dropped ayah-vocab word (default 0.55) |
 
 ---
 
@@ -224,6 +246,7 @@ docker compose exec backend bash -c '
 - Frontend published at **5173→80** (nginx), API at **8000**
 - Nginx proxies `/api/` and `/health` to `backend:8000`
 - Named volumes: `quran_data`, `hf_cache`
+- One-shot `model-prefetch` service writes Moonshine into `hf_cache` before backend starts
 - Healthcheck on backend `/health`; frontend waits until healthy
 
 **Dev (`docker-compose.dev.yml`):**
@@ -231,7 +254,7 @@ docker compose exec backend bash -c '
 - Backend bind-mount + uvicorn `--reload`
 - Frontend Node/Vite; proxy target `http://backend:8000`
 
-**Entrypoint order:** missing corpus → download; else → `--repair`; optional prefetch; then CMD.
+**Entrypoint order:** missing corpus → download; else → `--repair`; optional `PREFETCH_MODEL=1`; then CMD. Compose/K8s prefetch the model before the entrypoint.
 
 **Nginx note:** “client request body is buffered to a temporary file” on assess is **normal** for larger multipart bodies — not the root cause of 404s.
 
@@ -243,6 +266,7 @@ docker compose exec backend bash -c '
 - Namespace: `quran-memorization`
 - Images expected: `quran-memorization-backend:latest`, `quran-memorization-frontend:latest`
 - Frontend nginx assumes Service DNS name **`backend`**
+- PVCs: `quran-data` (corpus), `hf-model-cache` (Moonshine); initContainer prefetches STT weights
 - Ingress example host: `quran.local` (nginx ingress annotations for 6m body / 300s read timeout)
 - Load images into kind/minikube before apply (see `k8s/README.md`)
 
@@ -273,6 +297,9 @@ cd backend && pytest -q
 | Nginx body buffer warning | Large multipart upload | Harmless; ignore unless assess fails for other reasons |
 | First `npm install` aborted in agent env | Network/sandbox | Retried successfully; lockfile present |
 | Agent Docker socket / compose from sandbox | Sandbox lacks `/var/run/docker.sock` | Use full/`all` permissions for `docker compose` |
+| Continuous 1:1 stuck at 75%; dashed `بِسْمِ`; Heard missing `بسم` | Confidence filter dropped a weak first token, and/or STT glued `بسمالله` | `recover_against_ayah` after filter: in-vocab revive (≥0.55) + agglutination split; do not invent missing decode tokens (`specs/uthmani-tanzeel-word-matching-spec.md`) |
+| Continuous 1:3 live ~50%, `ٱلرَّحِيمِ` red, no advance (Single still passes) | Mid-utterance periodic STT + short-silence re-arm stalled long silence; UI treated provisional partial as hard fail | Stable coverage ticks (2); provisional chips; long silence → pass / fail / `session.listening` (cleared); audio kept while STT busy (`specs/continuous-vs-single-detection-spec.md`) |
+| Continuous “detection dead”: Score **0%**, Recognized empty, all words missing after Check now / pause | (1) Long-silence abandon cleared buffer; quiet leftover PCM failed `pcm_has_speech` at VAD floor; force scored empty as memorization fail. (2) Periodic STT used the same strict VAD RMS, so AGC-off/DTLN speech never transcribed | Force always STTs (≥ min utterance); empty Heard → `no_speech` + listening, not `ayah.result`; `STREAM_STT_RMS_THRESHOLD=0.008` for periodic/auto gates |
 
 **Log signature for the WebM bug:**
 
@@ -288,12 +315,9 @@ Response body length ~31 ≈ `{"detail":"Invalid audio file"}`.
 ## 14. How to run (cheat sheet)
 
 ```bash
-# Recommended local
+# Recommended local (prefetches STT model into hf_cache on first up)
 docker compose up --build
 # App http://localhost:5173  API http://localhost:8000/docs
-
-# Prefetch STT model at start
-PREFETCH_MODEL=1 docker compose up --build
 
 # Hot reload
 docker compose -f docker-compose.dev.yml up --build

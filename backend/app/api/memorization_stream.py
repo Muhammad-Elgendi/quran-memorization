@@ -67,6 +67,64 @@ def create_router(
 
         session: StreamSession | None = None
         summary_sent = False
+        stt_task: asyncio.Task | None = None
+
+        async def stt_worker() -> None:
+            nonlocal summary_sent
+            sess = session
+            if sess is None:
+                return
+            try:
+                while sess.state != SessionState.CLOSED:
+                    job = sess.pop_pending_assess()
+                    if job is not None:
+                        events = await asyncio.to_thread(
+                            sess.run_assess,
+                            reason=str(job.get("reason") or "silence"),
+                            recognized_hint=job.get("recognized"),
+                        )
+                    elif sess.should_run_periodic_stt():
+                        events = await asyncio.to_thread(sess.run_periodic_stt)
+                    else:
+                        break
+                    for ev in events:
+                        if ev.get("type") == "_assess_trigger":
+                            sess.push_pending_assess(ev)
+                            continue
+                        await _send(websocket, ev)
+                        if ev.get("type") == "session.summary":
+                            summary_sent = True
+                    if sess.state == SessionState.CLOSED:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "stream STT worker failed session=%s",
+                    sess.session_id,
+                )
+
+        def ensure_stt_worker() -> None:
+            nonlocal stt_task
+            if session is None or session.state == SessionState.CLOSED:
+                return
+            if stt_task is not None and not stt_task.done():
+                return
+            if not session.has_stt_work():
+                return
+            stt_task = asyncio.create_task(stt_worker())
+
+        async def cancel_stt_worker() -> None:
+            nonlocal stt_task
+            if stt_task is None or stt_task.done():
+                stt_task = None
+                return
+            stt_task.cancel()
+            try:
+                await stt_task
+            except asyncio.CancelledError:
+                pass
+            stt_task = None
 
         try:
             while True:
@@ -85,6 +143,8 @@ def create_router(
                         timeout=1.0,
                     )
                 except asyncio.TimeoutError:
+                    if session is not None:
+                        ensure_stt_worker()
                     continue
 
                 if message.get("type") == "websocket.disconnect":
@@ -107,24 +167,10 @@ def create_router(
                     events = session.on_audio_chunk(raw)
                     for ev in events:
                         if ev.get("type") == "_assess_trigger":
-                            assess_events = await asyncio.to_thread(
-                                session.run_assess,
-                                reason=ev.get("reason", "silence"),
-                            )
-                            for aev in assess_events:
-                                await _send(websocket, aev)
-                                if aev.get("type") == "session.summary":
-                                    summary_sent = True
-                            if session.state == SessionState.CLOSED:
-                                return
+                            session.push_pending_assess(ev)
                         else:
                             await _send(websocket, ev)
-
-                    # Rare, gated partials (default off).
-                    if session.config.partials and session.should_emit_partial():
-                        partial_events = await asyncio.to_thread(session.run_partial)
-                        for pev in partial_events:
-                            await _send(websocket, pev)
+                    ensure_stt_worker()
                     continue
 
                 text = message.get("text")
@@ -205,18 +251,21 @@ def create_router(
                         "pagehide": "pagehide",
                         "error": "client_error",
                     }.get(reason, "user_stop")
+                    await cancel_stt_worker()
                     await _send(websocket, session.summary_event(mapped))
                     summary_sent = True
                     return
 
                 if msg_type == "ayah.force_assess":
-                    events = await asyncio.to_thread(
-                        session.run_assess, reason="force"
+                    session.push_pending_assess(
+                        {"type": "_assess_trigger", "reason": "force"}
                     )
-                    for ev in events:
-                        await _send(websocket, ev)
-                        if ev.get("type") == "session.summary":
-                            summary_sent = True
+                    ensure_stt_worker()
+                    if stt_task is not None and not stt_task.done():
+                        await stt_task
+                    ensure_stt_worker()
+                    if stt_task is not None and not stt_task.done():
+                        await stt_task
                     if session.state == SessionState.CLOSED:
                         return
                     continue
@@ -273,6 +322,7 @@ def create_router(
                 except Exception:
                     pass
         finally:
+            await cancel_stt_worker()
             if session is not None and not summary_sent and session.state != SessionState.CLOSED:
                 try:
                     await _send(websocket, session.summary_event("disconnect"))

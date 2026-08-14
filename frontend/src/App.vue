@@ -1,7 +1,17 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import api from "./api";
-import { startPcmCapture, streamWsUrl } from "./stream";
+import {
+  startPcmCapture,
+  startProcessedStream,
+  streamWsUrl,
+} from "./stream";
+import { describeDenoiseMode } from "./audio/capture-service";
+import { heardTextFromMessage, wordsFromAlignment } from "./highlight";
+
+const labTrace =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).has("lab");
 
 const surahs = ref([]);
 const selectedSurah = ref(null);
@@ -10,7 +20,7 @@ const endAyah = ref(null);
 const ayahOptions = ref([]);
 const threshold = ref(0.85);
 const mode = ref("single"); // single | continuous
-const failPolicy = ref("continue"); // continue | stop (UI only)
+const failPolicy = ref("retry"); // retry | continue | stop
 
 const recording = ref(false);
 const sessionActive = ref(false);
@@ -24,14 +34,45 @@ const currentAyah = ref(null);
 const lastAyahResult = ref(null);
 const sessionSummary = ref(null);
 const sessionId = ref(null);
+const wsTrace = ref([]);
+const liveAlignment = ref([]);
+const liveProgress = ref(0);
+const liveRecognized = ref("");
+const liveSequenceConfidence = ref(null);
+const liveFromPartial = ref(false);
 
 let mediaRecorder = null;
 let audioChunks = [];
 let ws = null;
 let pcmCapture = null;
+let processedCapture = null;
 
 const isContinuous = computed(() => mode.value === "continuous");
 const continuousBusy = computed(() => sessionActive.value || micActive.value);
+
+const liveHighlightedWords = computed(() => {
+  if (!currentAyah.value?.text) {
+    return [];
+  }
+  return wordsFromAlignment(currentAyah.value.text, liveAlignment.value, {
+    provisional: liveFromPartial.value,
+  });
+});
+
+const resultHighlightedWords = computed(() => {
+  if (!result.value?.expected) {
+    return [];
+  }
+  return wordsFromAlignment(result.value.expected, result.value.alignment);
+});
+
+function clearLiveHighlights() {
+  liveAlignment.value = [];
+  liveProgress.value = 0;
+  liveRecognized.value = "";
+  liveSequenceConfidence.value = null;
+  liveFromPartial.value = false;
+}
 
 async function loadAyahOptions(surahNumber) {
   if (!surahNumber) {
@@ -89,8 +130,8 @@ async function startRecording() {
   error.value = "";
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(stream);
+    processedCapture = await startProcessedStream();
+    mediaRecorder = new MediaRecorder(processedCapture.stream);
     audioChunks = [];
 
     mediaRecorder.ondataavailable = (event) => {
@@ -101,19 +142,40 @@ async function startRecording() {
     mediaRecorder.onstop = uploadRecording;
     mediaRecorder.start();
     recording.value = true;
+    if (processedCapture.fallbackUsed) {
+      status.value =
+        "Enhanced mic unavailable — using browser noise filter instead.";
+    } else {
+      status.value = `Mic: ${describeDenoiseMode(processedCapture.denoiseMode)}`;
+    }
   } catch {
     error.value =
       "Microphone permission denied or unavailable. Allow mic access and try again.";
+    if (processedCapture) {
+      try {
+        await processedCapture.stop();
+      } catch {
+        /* ignore */
+      }
+      processedCapture = null;
+    }
   }
 }
 
-function stopRecording() {
+async function stopRecording() {
   if (!mediaRecorder) {
     return;
   }
   mediaRecorder.stop();
-  mediaRecorder.stream.getTracks().forEach((track) => track.stop());
   recording.value = false;
+  if (processedCapture) {
+    try {
+      await processedCapture.stop();
+    } catch {
+      /* ignore */
+    }
+    processedCapture = null;
+  }
 }
 
 async function uploadRecording() {
@@ -146,17 +208,75 @@ async function uploadRecording() {
 
 // --- Continuous (WebSocket) ---------------------------------------------
 
+function recordWsMessage(direction, payload) {
+  if (!labTrace) {
+    return;
+  }
+  wsTrace.value.push({
+    direction,
+    ts: new Date().toISOString(),
+    payload,
+  });
+}
+
+function downloadWsTrace() {
+  const blob = new Blob([JSON.stringify(wsTrace.value, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `ws-trace-${sessionId.value || "session"}.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 function handleStreamMessage(msg) {
+  recordWsMessage("in", msg);
   switch (msg.type) {
     case "session.ready":
       sessionId.value = msg.session_id;
       currentAyah.value = msg.current;
       sessionActive.value = true;
+      clearLiveHighlights();
       status.value = `Ready — ${msg.current.surah}:${msg.current.ayah}. Press Start Recitation.`;
+      break;
+    case "partial.transcript":
+      liveRecognized.value = heardTextFromMessage(msg);
+      if (typeof msg.sequence_confidence === "number") {
+        liveSequenceConfidence.value = msg.sequence_confidence;
+      }
+      break;
+    case "partial.alignment":
+      liveAlignment.value = msg.alignment || [];
+      liveProgress.value =
+        typeof msg.progress === "number" ? msg.progress : liveProgress.value;
+      liveFromPartial.value = true;
+      if (micActive.value && currentAyah.value) {
+        const pct = Math.round(liveProgress.value * 100);
+        status.value = `Listening — ${currentAyah.value.surah}:${currentAyah.value.ayah} · ${pct}% in progress`;
+      }
       break;
     case "ayah.result":
       lastAyahResult.value = msg;
       result.value = msg;
+      liveAlignment.value = msg.alignment || [];
+      liveFromPartial.value = false;
+      liveProgress.value =
+        typeof msg.coverage === "number"
+          ? msg.coverage
+          : typeof msg.score === "number"
+            ? msg.score
+            : liveProgress.value;
+      if (msg.recognized || msg.stt_words || msg.words) {
+        liveRecognized.value = heardTextFromMessage({
+          recognized: msg.recognized,
+          words: msg.stt_words || msg.words,
+        });
+      }
+      if (typeof msg.sequence_confidence === "number") {
+        liveSequenceConfidence.value = msg.sequence_confidence;
+      }
       if (msg.warning || !msg.passed) {
         playWarning();
       }
@@ -166,6 +286,7 @@ function handleStreamMessage(msg) {
       break;
     case "session.advance":
       currentAyah.value = msg.to;
+      clearLiveHighlights();
       status.value = micActive.value
         ? `Listening — ${msg.to.surah}:${msg.to.ayah}`
         : `Next — ${msg.to.surah}:${msg.to.ayah}. Press Start Recitation.`;
@@ -173,10 +294,21 @@ function handleStreamMessage(msg) {
     case "session.waiting":
       status.value = msg.hint || "Retry the same ayah.";
       break;
+    case "session.listening":
+      if (msg.cleared) {
+        clearLiveHighlights();
+      }
+      status.value =
+        msg.hint ||
+        (currentAyah.value
+          ? `Still listening — ${currentAyah.value.surah}:${currentAyah.value.ayah}`
+          : "Still listening.");
+      break;
     case "session.summary":
       sessionSummary.value = msg;
       status.value = "Session ended.";
       sessionActive.value = false;
+      clearLiveHighlights();
       break;
     case "error":
       error.value = msg.message || "Stream error";
@@ -204,6 +336,7 @@ function ensureSession() {
     lastAyahResult.value = null;
     sessionSummary.value = null;
     currentAyah.value = null;
+    clearLiveHighlights();
     status.value = "Connecting…";
 
     const url = streamWsUrl();
@@ -213,30 +346,33 @@ function ensureSession() {
     let settled = false;
 
     ws.onopen = () => {
-      ws.send(
-        JSON.stringify({
-          type: "session.start",
-          start_surah: selectedSurah.value,
-          start_ayah: selectedAyah.value,
-          end_surah: endAyah.value ? selectedSurah.value : null,
-          end_ayah: endAyah.value || null,
-          threshold: threshold.value,
-          fail_policy: failPolicy.value,
-          cross_surah: false,
-          partials: false,
-          auto_advance: true,
-          audio: {
-            format: "pcm_s16le",
-            sample_rate: 16000,
-            channels: 1,
-            chunk_ms: 250,
-          },
-        }),
-      );
+      const startPayload = {
+        type: "session.start",
+        start_surah: selectedSurah.value,
+        start_ayah: selectedAyah.value,
+        end_surah: endAyah.value ? selectedSurah.value : null,
+        end_ayah: endAyah.value || null,
+        threshold: threshold.value,
+        fail_policy: failPolicy.value,
+        cross_surah: false,
+        partials: true,
+        auto_advance: true,
+        audio: {
+          format: "pcm_s16le",
+          sample_rate: 16000,
+          channels: 1,
+          chunk_ms: 250,
+        },
+      };
+      recordWsMessage("out", startPayload);
+      ws.send(JSON.stringify(startPayload));
     };
 
     ws.onmessage = (event) => {
       if (typeof event.data !== "string") {
+        if (labTrace) {
+          recordWsMessage("in", { type: "binary", bytes: event.data.byteLength });
+        }
         return;
       }
       try {
@@ -298,6 +434,7 @@ async function startMic() {
       chunkMs: 250,
       onChunk: (buffer) => {
         if (ws && ws.readyState === WebSocket.OPEN && micActive.value) {
+          recordWsMessage("out", { type: "binary", bytes: buffer.byteLength });
           ws.send(buffer);
         }
       },
@@ -308,9 +445,12 @@ async function startMic() {
     });
     micActive.value = true;
     const cur = currentAyah.value;
+    const denoiseHint = pcmCapture.fallbackUsed
+      ? " (browser filter)"
+      : ` (${describeDenoiseMode(pcmCapture.denoiseMode)})`;
     status.value = cur
-      ? `Mic on — recite ${cur.surah}:${cur.ayah}`
-      : "Mic on — recite continuously.";
+      ? `Mic on${denoiseHint} — recite ${cur.surah}:${cur.ayah}`
+      : `Mic on${denoiseHint} — recite continuously.`;
   } catch {
     error.value =
       "Microphone permission denied or AudioWorklet unavailable.";
@@ -349,13 +489,17 @@ async function endContinuousSession() {
 
 function forceAssess() {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "ayah.force_assess" }));
+    const payload = { type: "ayah.force_assess" };
+    recordWsMessage("out", payload);
+    ws.send(JSON.stringify(payload));
   }
 }
 
 function forceAdvance() {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "ayah.force_advance", reason: "skip" }));
+    const payload = { type: "ayah.force_advance", reason: "skip" };
+    recordWsMessage("out", payload);
+    ws.send(JSON.stringify(payload));
   }
 }
 
@@ -458,6 +602,7 @@ onBeforeUnmount(() => {
         <label v-if="isContinuous">
           On fail
           <select v-model="failPolicy" :disabled="continuousBusy">
+            <option value="retry">Retry same ayah (recommended)</option>
             <option value="continue">Continue to next ayah</option>
             <option value="stop">Stop session</option>
           </select>
@@ -472,8 +617,43 @@ onBeforeUnmount(() => {
         <p class="live-meta">
           {{ currentAyah.surah }}:{{ currentAyah.ayah }}
           <span v-if="micActive" class="mic-live"> · mic on</span>
+          <span v-if="liveProgress > 0" class="live-progress-label">
+            · {{ Math.round(liveProgress * 100) }}%
+            <template v-if="liveFromPartial"> in progress</template>
+          </span>
+          <span
+            v-if="labTrace && liveSequenceConfidence != null"
+            class="live-progress-label"
+          >
+            · STT {{ Math.round(liveSequenceConfidence * 100) }}%
+          </span>
         </p>
-        <p class="ayah">{{ currentAyah.text }}</p>
+        <div
+          v-if="liveProgress > 0 || liveHighlightedWords.some((w) => w.status !== 'pending')"
+          class="progress-track"
+          dir="ltr"
+          role="progressbar"
+          :aria-valuenow="Math.round(liveProgress * 100)"
+          aria-valuemin="0"
+          aria-valuemax="100"
+        >
+          <div
+            class="progress-fill"
+            :style="{ width: `${Math.min(100, Math.round(liveProgress * 100))}%` }"
+          />
+        </div>
+        <p class="ayah ayah-words">
+          <span
+            v-for="(item, idx) in liveHighlightedWords"
+            :key="idx"
+            class="word"
+            :class="`word-${item.status}`"
+          >{{ item.word }}</span>
+        </p>
+        <p v-if="liveRecognized" class="live-heard" dir="ltr">
+          Heard:
+          <span dir="rtl">{{ liveRecognized }}</span>
+        </p>
       </section>
 
       <section class="recording">
@@ -519,11 +699,19 @@ onBeforeUnmount(() => {
           >
             End session
           </button>
+          <button
+            v-if="labTrace && wsTrace.length"
+            class="secondary"
+            type="button"
+            @click="downloadWsTrace"
+          >
+            Download WS trace ({{ wsTrace.length }})
+          </button>
         </template>
       </section>
 
       <p v-if="loading" class="status">Analyzing your recitation…</p>
-      <p v-if="status && isContinuous" class="status">{{ status }}</p>
+      <p v-if="status" class="status">{{ status }}</p>
       <p v-if="error" class="error">{{ error }}</p>
 
       <section v-if="sessionSummary" class="result summary">
@@ -533,6 +721,16 @@ onBeforeUnmount(() => {
           {{ sessionSummary.ayahs_failed }} · Skipped
           {{ sessionSummary.ayahs_skipped }}
           ({{ sessionSummary.reason }})
+        </p>
+        <p
+          v-if="sessionSummary.stt_ms_total != null"
+          class="meta"
+        >
+          STT {{ sessionSummary.stt_ms_total }} ms /
+          {{ sessionSummary.wall_ms }} ms wall
+          <template v-if="sessionSummary.busy_errors">
+            · {{ sessionSummary.busy_errors }} busy skips
+          </template>
         </p>
         <ul v-if="sessionSummary.results?.length">
           <li
@@ -555,10 +753,29 @@ onBeforeUnmount(() => {
         </div>
 
         <h3>Recognized</h3>
-        <p class="ayah" dir="rtl">{{ result.recognized || "—" }}</p>
+        <p class="ayah" dir="rtl">
+          {{
+            heardTextFromMessage({
+              recognized: result.recognized,
+              words: result.stt_words,
+            }) || "—"
+          }}
+        </p>
 
         <h3>Expected</h3>
-        <p class="ayah" dir="rtl">{{ result.expected }}</p>
+        <p
+          v-if="resultHighlightedWords.length"
+          class="ayah ayah-words"
+          dir="rtl"
+        >
+          <span
+            v-for="(item, idx) in resultHighlightedWords"
+            :key="idx"
+            class="word"
+            :class="`word-${item.status}`"
+          >{{ item.word }}</span>
+        </p>
+        <p v-else class="ayah" dir="rtl">{{ result.expected }}</p>
 
         <div v-if="result.wrong_words?.length">
           <h3>Possible mistakes</h3>
@@ -689,6 +906,68 @@ select {
 .mic-live {
   color: var(--fail);
   font-weight: 600;
+}
+
+.live-progress-label {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.progress-track {
+  height: 0.35rem;
+  margin: 0 0 0.75rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border) 70%, white);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.ayah-words {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.55rem;
+  line-height: 1.85;
+}
+
+.word {
+  border-radius: 0.35rem;
+  padding: 0.05rem 0.2rem;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.word-pending {
+  color: var(--ink);
+  opacity: 0.55;
+}
+
+.word-match {
+  background: var(--pass-soft);
+  color: var(--pass);
+}
+
+.word-wrong {
+  background: var(--fail-soft);
+  color: var(--fail);
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+}
+
+.word-missing {
+  background: color-mix(in srgb, var(--accent) 14%, white);
+  color: var(--muted);
+  outline: 1px dashed color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.live-heard {
+  margin: 0.65rem 0 0;
+  font-size: 0.9rem;
+  color: var(--muted);
 }
 
 .recording {

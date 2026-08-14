@@ -1,4 +1,18 @@
 services:
+  model-prefetch:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: quran-memorization-backend:local
+    environment:
+      MOONSHINE_MODEL: "UsefulSensors/moonshine-tiny-ar"
+      HF_HOME: /models/huggingface
+      HF_HUB_CACHE: /models/huggingface/hub
+    volumes:
+      - hf_cache:/models/huggingface
+    entrypoint: ["python", "/app/backend/prefetch_model.py"]
+    restart: "no"
+
   backend:
     build:
       context: .
@@ -16,12 +30,14 @@ services:
       MAX_AUDIO_SECONDS: "20.0"
       MOONSHINE_MODEL: "UsefulSensors/moonshine-tiny-ar"
       CORS_ORIGINS: "*"
-      PREFETCH_MODEL: "${PREFETCH_MODEL:-0}"
       HF_HOME: /models/huggingface
-      TRANSFORMERS_CACHE: /models/huggingface
+      HF_HUB_CACHE: /models/huggingface/hub
     volumes:
       - quran_data:/app/backend/data
       - hf_cache:/models/huggingface
+    depends_on:
+      model-prefetch:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
       interval: 15s

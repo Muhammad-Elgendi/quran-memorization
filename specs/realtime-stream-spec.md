@@ -266,6 +266,11 @@ User skips current ayah without a passing score. Still recorded in summary as `s
 
 Force ayah-final assessment on the current audio buffer (e.g. user taps “Check now” without waiting for silence detection).
 
+**Implementation notes (Continuous):**
+
+- Always runs STT when the ring buffer holds at least `STREAM_MIN_UTTERANCE_MS` of audio. It does **not** short-circuit on the VAD/STT energy gate (quiet AGC-off / denoise levels must still be transcribed).
+- If Heard is empty after STT (or the buffer is too short), the server emits a non-fatal `error` with `code: "no_speech"` and `session.listening` — **not** `ayah.result` with Score 0%. Empty audio is not a memorization fail.
+
 #### `ping`
 
 ```json
@@ -545,13 +550,24 @@ If the user does not pause between ayahs:
 
 ```text
 STREAM_SILENCE_MS=800
+STREAM_SHORT_SILENCE_MS=400
 STREAM_MIN_UTTERANCE_MS=400
-STREAM_PARTIAL_EVERY_MS=500
+STREAM_PARTIAL_EVERY_MS=2000
+STREAM_COMPLETION_PROBE=true
+STREAM_COMPLETION_PROBE_MS=1000
 STREAM_COVERAGE_THRESHOLD=0.85
+STREAM_COVERAGE_STABLE_TICKS=2
 STREAM_OVERLAP_MS=300
+STREAM_PARTIALS_DEFAULT=true
+STREAM_VAD_RMS_THRESHOLD=0.015
+STREAM_STT_RMS_THRESHOLD=0.008
 STREAM_IDLE_TIMEOUT_S=60
 STREAM_MAX_SESSION_S=1800
 ```
+
+- **VAD RMS** segments speech vs silence.
+- **STT RMS** (lower) decides whether automatic periodic STT is worth calling. Check now ignores this gate (see `ayah.force_assess` above).
+- **Stable ticks** require consecutive high-coverage probes before auto-finalize (avoids mid-word `ayah.result` on short ayahs).
 
 ---
 

@@ -8,21 +8,23 @@ alwaysApply: false
 
 ## Compose
 
-- `docker-compose.yml`: backend + nginx frontend; volumes `quran_data`, `hf_cache`.
-- `docker-compose.dev.yml`: bind-mount backend + Vite; proxy via `VITE_PROXY_TARGET=http://backend:8000`.
+- `docker-compose.yml`: `model-prefetch` + backend + nginx frontend; volumes `quran_data`, `hf_cache`.
+- `docker-compose.dev.yml`: same prefetch service; bind-mount backend + Vite; proxy via `VITE_PROXY_TARGET=http://backend:8000`.
 - Frontend nginx proxies `/api/` and `/health` to `http://backend:8000` (Service name must be `backend` in K8s too).
-- `PREFETCH_MODEL=1` downloads Moonshine at container start (~112MB into `hf_cache`).
+- Moonshine is prefetched into `hf_cache` / `/models/huggingface` (`HF_HOME` + `HF_HUB_CACHE=.../hub`). Do not set `TRANSFORMERS_CACHE` to `HF_HOME`.
+- `PREFETCH_MODEL=1` is only for bare `docker run` (entrypoint). Compose/K8s prefetch via a one-shot job / initContainer.
 - Nginx may log “request body buffered to temporary file” on assess uploads — normal, not the failure.
 
 ## Entrypoint (`docker/backend-entrypoint.sh`)
 
 1. If no `data/quran.json` → full download.
 2. Else → `python download_quran.py --repair` (fixes Fatihah on old volumes).
-3. Optional model prefetch, then `exec` CMD.
+3. Optional `PREFETCH_MODEL=1` (`prefetch_model.py`), then `exec` CMD.
+4. Compose/K8s prefetch the model *before* this (prefetch service / initContainer).
 
 ## K8s (`k8s/deploy.yaml`)
 
-Namespace `quran-memorization`; ConfigMap `backend-config`; PVCs for Quran data + HF cache; Ingress host `quran.local`. Build/load images then `kubectl apply -f k8s/deploy.yaml`. See `k8s/README.md`.
+Namespace `quran-memorization`; ConfigMap `backend-config`; PVCs `quran-data` + `hf-model-cache`; backend initContainer `prefetch-stt-model`; Ingress host `quran.local`. Build/load images then `kubectl apply -f k8s/deploy.yaml`. See `k8s/README.md`.
 
 ## Rebuild reminder
 

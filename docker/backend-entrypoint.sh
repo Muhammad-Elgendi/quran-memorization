@@ -13,11 +13,7 @@ fi
 
 if [ "${PREFETCH_MODEL:-0}" = "1" ]; then
   echo "Prefetching speech model..."
-  python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id="UsefulSensors/moonshine-tiny-ar")
-print("Model ready.")
-PY
+  python prefetch_model.py
 fi
 
 exec "$@"

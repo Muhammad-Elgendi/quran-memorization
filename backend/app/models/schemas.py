@@ -39,6 +39,10 @@ class AssessmentResponse(BaseModel):
     wrong_words: list[dict[str, Any]]
     message: str
     alignment: list[dict[str, Any]] = Field(default_factory=list)
+    sequence_confidence: Optional[float] = None
+    stt_words: Optional[list[dict[str, Any]]] = None
+    raw_recognized: Optional[str] = None
+    recovery: Optional[dict[str, Any]] = None
 
 
 class HealthResponse(BaseModel):

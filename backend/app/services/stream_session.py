@@ -16,7 +16,15 @@ from ..config import settings
 from .assessor import MemorizationAssessor
 from .quran_service import QuranService
 from .speech_service import SpeechRecognizer
-from .stream_audio import EnergyVadSegmenter, PcmRingBuffer
+from .stream_audio import EnergyVadSegmenter, PcmRingBuffer, pcm_has_speech
+from .stt_confidence import (
+    Transcription,
+    apply_ayah_recovery,
+    recovery_debug_fields,
+    stt_words_payload,
+    transcription_from_plain_text,
+    trim_overgenerated_partial,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +42,8 @@ class SessionState(str, Enum):
 
 ALLOWED_FAIL_POLICIES = frozenset({"retry", "continue", "stop"})
 ALLOWED_AUDIO_FORMATS = frozenset({"pcm_s16le"})
+_ASSESS_PRIORITY = {"force": 4, "silence": 3, "silence_short": 2, "coverage": 1}
+INCOMPLETE_LISTEN_HINT = "Still listening — finish the ayah, or tap Check now."
 
 
 def _utc_now() -> datetime:
@@ -96,6 +106,14 @@ class StreamSession:
         self.stt_busy = False
         self.last_activity = time.monotonic()
         self._last_partial_at = 0.0
+        self._last_probe_at = 0.0
+        self._last_periodic_at = 0.0
+        self._busy_count = 0
+        self._stt_ms_total = 0
+        self._last_stt: Transcription | None = None
+        self._coverage_streak = 0
+        self._stt_queued = False
+        self._pending_assess: dict[str, Any] | None = None
 
         self.buffer = PcmRingBuffer(
             sample_rate=config.sample_rate,
@@ -179,6 +197,7 @@ class StreamSession:
                     "skipped": s.skipped,
                 }
             )
+        wall_ms = int((self.ended_at - self.started_at).total_seconds() * 1000)
         return self.base_event(
             "session.summary",
             started_at=_iso(self.started_at),
@@ -189,6 +208,9 @@ class StreamSession:
             ayahs_failed=failed,
             ayahs_skipped=skipped,
             results=results,
+            busy_errors=self._busy_count,
+            stt_ms_total=self._stt_ms_total,
+            wall_ms=wall_ms,
         )
 
     def error_event(
@@ -198,12 +220,112 @@ class StreamSession:
         *,
         fatal: bool = True,
     ) -> dict[str, Any]:
+        if code == "busy":
+            self._busy_count += 1
         return self.base_event(
             "error",
             code=code,
             message=message,
             fatal=fatal,
         )
+
+    def uses_unified_periodic(self) -> bool:
+        """A4: one STT tick feeds partial UX + completion probe when both enabled."""
+        return self.config.partials and settings.STREAM_COMPLETION_PROBE
+
+    def _record_stt_ms(self, stt_ms: int) -> None:
+        self._stt_ms_total += max(0, stt_ms)
+
+    def _reset_stream_decode_state(self) -> None:
+        self._last_stt = None
+        self._coverage_streak = 0
+        self._stt_queued = False
+        self._pending_assess = None
+
+    def push_pending_assess(self, trigger: dict[str, Any]) -> None:
+        """Keep the highest-priority pending finalize (latest wins ties)."""
+        reason = str(trigger.get("reason") or "silence")
+        incoming = _ASSESS_PRIORITY.get(reason, 0)
+        if self._pending_assess is None:
+            self._pending_assess = dict(trigger)
+            return
+        held = _ASSESS_PRIORITY.get(
+            str(self._pending_assess.get("reason") or "silence"), 0
+        )
+        if incoming >= held:
+            self._pending_assess = dict(trigger)
+
+    def pop_pending_assess(self) -> dict[str, Any] | None:
+        job = self._pending_assess
+        self._pending_assess = None
+        if not job:
+            return None
+        # Audio arrived while STT was busy — don't trust a stale coverage hint.
+        if job.get("reason") != "force" and self._stt_queued:
+            job = {**job, "recognized": None}
+        return job
+
+    def has_stt_work(self) -> bool:
+        return self._pending_assess is not None or self.should_run_periodic_stt()
+
+    def _listening_event(self, *, cleared: bool, hint: str | None = None) -> dict[str, Any]:
+        return self.base_event(
+            "session.listening",
+            surah=self.current_surah,
+            ayah=self.current_ayah,
+            incomplete=True,
+            cleared=cleared,
+            hint=hint or INCOMPLETE_LISTEN_HINT,
+        )
+
+    def _pcm_has_stt_energy(self, samples) -> bool:
+        return pcm_has_speech(
+            samples,
+            self.config.sample_rate,
+            rms_threshold=settings.STREAM_STT_RMS_THRESHOLD,
+        )
+
+    def _no_speech_events(self, *, cleared: bool) -> list[dict[str, Any]]:
+        """Check now / finalize heard nothing — not a memorization fail."""
+        self.stt_busy = False
+        self.state = SessionState.LISTENING
+        return [
+            self.error_event(
+                "no_speech",
+                "No speech detected — recite the ayah, then tap Check now.",
+                fatal=False,
+            ),
+            self._listening_event(
+                cleared=cleared,
+                hint="No speech detected — finish the ayah, or tap Check now.",
+            ),
+        ]
+
+    def _abandon_incomplete_attempt(self) -> list[dict[str, Any]]:
+        """Long silence without enough coverage: drop audio so a retry is clean."""
+        self.buffer.clear(keep_overlap_ms=0.0)
+        self._reset_stream_decode_state()
+        self.vad.reset()
+        self.stt_busy = False
+        self.state = SessionState.LISTENING
+        return [
+            self.base_event(
+                "partial.transcript",
+                surah=self.current_surah,
+                ayah=self.current_ayah,
+                recognized="",
+                stable=False,
+            ),
+            self.base_event(
+                "partial.alignment",
+                surah=self.current_surah,
+                ayah=self.current_ayah,
+                alignment=[],
+                progress=0.0,
+                provisional=True,
+            ),
+            self._listening_event(cleared=True),
+        ]
 
     # --- validation ------------------------------------------------------
 
@@ -370,14 +492,16 @@ class StreamSession:
     # --- audio / assess --------------------------------------------------
 
     def accepts_audio(self) -> bool:
-        return self.state in {SessionState.READY, SessionState.LISTENING}
+        return self.state in {
+            SessionState.READY,
+            SessionState.LISTENING,
+            SessionState.ASSESSING,
+        }
 
     def on_audio_chunk(self, raw: bytes) -> list[dict[str, Any]]:
         """Ingest binary PCM; may return segment-ready signal events (empty usually)."""
         self.touch()
         if not self.accepts_audio():
-            if self.state == SessionState.ASSESSING:
-                return []
             return [
                 self.error_event(
                     "not_ready",
@@ -395,10 +519,16 @@ class StreamSession:
                 )
             ]
 
+        assessing = self.state == SessionState.ASSESSING
         if self.state == SessionState.READY:
             self.state = SessionState.LISTENING
 
         self.buffer.append_pcm_s16le(raw)
+        if self.stt_busy or assessing:
+            self._stt_queued = True
+        # Don't nest a VAD finalize while ayah-final STT is already running.
+        if assessing:
+            return []
         # Feed only the new chunk to VAD (decode once).
         if len(raw) % 2:
             raw = raw[:-1]
@@ -406,81 +536,182 @@ class StreamSession:
             samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
             segment = self.vad.feed(samples)
             if segment is not None:
-                return [{"type": "_assess_trigger", "reason": "silence"}]
+                return [
+                    {
+                        "type": "_assess_trigger",
+                        "reason": segment.reason,
+                    }
+                ]
         return []
 
-    def should_emit_partial(self) -> bool:
-        if not self.config.partials:
-            return False
+    def should_run_periodic_stt(self) -> bool:
+        """Gate for completion probe, partials, or unified A4 tick."""
         if self.stt_busy or self.state != SessionState.LISTENING:
+            if self.stt_busy:
+                self._stt_queued = True
+            return False
+        if self.buffer.duration_ms <= settings.STREAM_OVERLAP_MS + 1:
             return False
         if self.buffer.duration_ms < settings.STREAM_MIN_UTTERANCE_MS:
             return False
-        now = time.monotonic()
-        every = settings.STREAM_PARTIAL_EVERY_MS / 1000.0
-        if now - self._last_partial_at < every:
+
+        want_partial = self.config.partials
+        want_probe = settings.STREAM_COMPLETION_PROBE
+        if not want_partial and not want_probe:
             return False
-        return True
 
-    def mark_partial_emitted(self) -> None:
-        self._last_partial_at = time.monotonic()
+        queued = self._stt_queued
+        if queued:
+            return True
 
-    def run_partial(self) -> list[dict[str, Any]]:
-        """Optional light STT for UX. Skipped when busy / disabled."""
-        if not self.should_emit_partial():
-            if self.config.partials and self.stt_busy:
-                return [
-                    self.error_event(
-                        "busy",
-                        "Skipped partial; assessment in flight",
-                        fatal=False,
-                    )
-                ]
+        now = time.monotonic()
+        if self.uses_unified_periodic():
+            every = (
+                min(
+                    settings.STREAM_PARTIAL_EVERY_MS,
+                    settings.STREAM_COMPLETION_PROBE_MS,
+                )
+                / 1000.0
+            )
+            return now - self._last_periodic_at >= every
+        if want_probe:
+            every = settings.STREAM_COMPLETION_PROBE_MS / 1000.0
+            return now - self._last_probe_at >= every
+        every = settings.STREAM_PARTIAL_EVERY_MS / 1000.0
+        return now - self._last_partial_at >= every
+
+    def _mark_periodic_emitted(self) -> None:
+        now = time.monotonic()
+        self._stt_queued = False
+        if self.uses_unified_periodic():
+            self._last_periodic_at = now
+        elif settings.STREAM_COMPLETION_PROBE:
+            self._last_probe_at = now
+        else:
+            self._last_partial_at = now
+
+    def _expected_text(self) -> str:
+        ayah = self.quran.get_ayah(self.current_surah, self.current_ayah)
+        return ayah["text"] if ayah else ""
+
+    def _recover_heard(self, transcription: Transcription) -> Transcription:
+        return apply_ayah_recovery(self._expected_text(), transcription)
+
+    def _partial_display_text(
+        self,
+        recognized: str,
+        expected_text: str,
+    ) -> str:
+        text = (recognized or "").strip()
+        if not text:
+            return ""
+        return trim_overgenerated_partial(expected_text, text)
+
+    def _partial_events_from_recognized(
+        self,
+        recognized: str,
+        *,
+        stt_ms: int,
+        transcription: Transcription | None = None,
+    ) -> list[dict[str, Any]]:
+        expected = self.quran.get_ayah(self.current_surah, self.current_ayah)
+        expected_text = expected["text"] if expected else ""
+        display = self._partial_display_text(recognized, expected_text)
+        if not display:
             return []
 
-        self.stt_busy = True
-        self.mark_partial_emitted()
-        t0 = time.perf_counter()
-        try:
-            samples = self.buffer.snapshot()
-            # Cap partial window to last ~3s to keep STT cheap.
+        transcript_event = self.base_event(
+            "partial.transcript",
+            surah=self.current_surah,
+            ayah=self.current_ayah,
+            recognized=display,
+            stable=False,
+            stt_ms=stt_ms,
+        )
+        if (
+            transcription is not None
+            and transcription.scored
+            and settings.STT_CONFIDENCE_FILTER
+        ):
+            transcript_event["sequence_confidence"] = round(
+                transcription.sequence_confidence, 4
+            )
+            display_words = display.split()
+            di = 0
+            words_out: list[dict[str, Any]] = []
+            for word in transcription.words:
+                payload = {
+                    "text": word.text,
+                    "confidence": round(word.confidence, 4),
+                    "kept": word.kept,
+                }
+                if word.kept:
+                    if di < len(display_words) and word.text == display_words[di]:
+                        di += 1
+                    else:
+                        payload["kept"] = False
+                words_out.append(payload)
+            transcript_event["words"] = words_out
+        if transcription is not None:
+            transcript_event.update(recovery_debug_fields(transcription))
+
+        events: list[dict[str, Any]] = [transcript_event]
+        if expected_text:
+            assessor = MemorizationAssessor(threshold=self.config.threshold)
+            progress = assessor.progress(expected_text, display)
+            result = assessor.assess(expected_text, display)
+            provisional = progress < settings.STREAM_COVERAGE_THRESHOLD
+            events.append(
+                self.base_event(
+                    "partial.alignment",
+                    surah=self.current_surah,
+                    ayah=self.current_ayah,
+                    alignment=result.alignment[:40],
+                    progress=round(progress, 3),
+                    provisional=provisional,
+                )
+            )
+        return events
+
+    def run_periodic_stt(self) -> list[dict[str, Any]]:
+        """Periodic STT: probe-only, partial-only, or unified A4 (one pass, both outputs)."""
+        if not self.should_run_periodic_stt():
+            return []
+
+        samples = self.buffer.snapshot()
+        min_samples = int(
+            self.config.sample_rate * settings.STREAM_MIN_UTTERANCE_MS / 1000.0
+        )
+        if samples.size < min_samples:
+            return []
+
+        unified = self.uses_unified_periodic()
+        want_partial = self.config.partials
+        want_probe = settings.STREAM_COMPLETION_PROBE
+
+        # Partial-only arm (A2): cap window to last ~3s to keep CPU down.
+        if want_partial and not want_probe and not unified:
             max_samples = int(self.config.sample_rate * 3.0)
             if len(samples) > max_samples:
                 samples = samples[-max_samples:]
-            recognized = self.recognizer.transcribe_audio(
-                samples, self.config.sample_rate
+
+        if not self._pcm_has_stt_energy(samples):
+            self._mark_periodic_emitted()
+            return []
+
+        self.stt_busy = True
+        self._mark_periodic_emitted()
+        t0 = time.perf_counter()
+        try:
+            transcription = self.recognizer.transcribe_audio_detailed(
+                samples,
+                self.config.sample_rate,
+                threshold=self.config.threshold,
             )
             stt_ms = int((time.perf_counter() - t0) * 1000)
-            events = [
-                self.base_event(
-                    "partial.transcript",
-                    surah=self.current_surah,
-                    ayah=self.current_ayah,
-                    recognized=recognized or "",
-                    stable=False,
-                    stt_ms=stt_ms,
-                )
-            ]
-            # Lightweight progress only — full assessor on finals.
-            expected = self.quran.get_ayah(self.current_surah, self.current_ayah)
-            if expected and recognized:
-                assessor = MemorizationAssessor(threshold=self.config.threshold)
-                result = assessor.assess(expected["text"], recognized)
-                equal = sum(1 for a in result.alignment if a.get("op") == "equal")
-                total = max(1, len(result.alignment))
-                progress = min(1.0, equal / total)
-                events.append(
-                    self.base_event(
-                        "partial.alignment",
-                        surah=self.current_surah,
-                        ayah=self.current_ayah,
-                        alignment=result.alignment[:40],
-                        progress=round(progress, 3),
-                    )
-                )
-            return events
+            self._record_stt_ms(stt_ms)
         except Exception:
-            logger.exception("partial STT failed session=%s", self.session_id)
+            logger.exception("periodic STT failed session=%s", self.session_id)
             return [
                 self.error_event(
                     "stt_unavailable",
@@ -491,50 +722,194 @@ class StreamSession:
         finally:
             self.stt_busy = False
 
-    def run_assess(self, *, reason: str = "silence") -> list[dict[str, Any]]:
+        transcription = self._recover_heard(transcription)
+        self._last_stt = transcription
+        recognized = transcription.text or ""
+
+        events: list[dict[str, Any]] = []
+        if want_partial:
+            events.extend(
+                self._partial_events_from_recognized(
+                    recognized,
+                    stt_ms=stt_ms,
+                    transcription=transcription,
+                )
+            )
+
+        if want_probe:
+            expected = self.quran.get_ayah(self.current_surah, self.current_ayah)
+            coverage = 0.0
+            if expected and recognized:
+                assessor = MemorizationAssessor(threshold=self.config.threshold)
+                coverage = assessor.progress(expected["text"], recognized)
+            if expected and recognized and coverage >= settings.STREAM_COVERAGE_THRESHOLD:
+                self._coverage_streak += 1
+                needed = max(1, int(settings.STREAM_COVERAGE_STABLE_TICKS))
+                if self._coverage_streak >= needed:
+                    events.append(
+                        {
+                            "type": "_assess_trigger",
+                            "reason": "coverage",
+                            "recognized": recognized,
+                            "coverage": coverage,
+                        }
+                    )
+            else:
+                self._coverage_streak = 0
+        return events
+
+    def should_probe_completion(self) -> bool:
+        """Backward-compatible alias; prefer should_run_periodic_stt()."""
+        if self.uses_unified_periodic() or self.config.partials:
+            return self.should_run_periodic_stt()
+        return (
+            settings.STREAM_COMPLETION_PROBE and self.should_run_periodic_stt()
+        )
+
+    def run_completion_probe(self) -> list[dict[str, Any]]:
+        """Backward-compatible alias; prefer run_periodic_stt()."""
+        if self.uses_unified_periodic() or self.config.partials:
+            return self.run_periodic_stt()
+        if not settings.STREAM_COMPLETION_PROBE:
+            return []
+        return self.run_periodic_stt()
+
+    def should_emit_partial(self) -> bool:
+        """Backward-compatible alias; prefer should_run_periodic_stt()."""
+        if self.uses_unified_periodic():
+            return False
+        return self.config.partials and self.should_run_periodic_stt()
+
+    def run_partial(self) -> list[dict[str, Any]]:
+        """Backward-compatible alias; prefer run_periodic_stt()."""
+        if self.uses_unified_periodic():
+            return []
+        if not self.config.partials:
+            return []
+        return self.run_periodic_stt()
+
+    def run_assess(
+        self,
+        *,
+        reason: str = "silence",
+        recognized_hint: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Ayah-final STT + MemorizationAssessor + advance policy."""
         if self.stt_busy:
-            return [
-                self.error_event(
-                    "busy",
-                    "Assessment already in progress",
-                    fatal=False,
-                )
-            ]
+            self.push_pending_assess(
+                {"reason": reason, "recognized": recognized_hint}
+            )
+            self._stt_queued = True
+            return []
 
         samples = self.buffer.snapshot()
         if samples.size < int(
             self.config.sample_rate * settings.STREAM_MIN_UTTERANCE_MS / 1000.0
         ):
+            if reason == "force":
+                return self._no_speech_events(cleared=False)
+            return []
+
+        # Energy gate is for automatic paths only. Check now always STTs —
+        # quiet AGC-off / denoise audio often sits under the VAD RMS floor
+        # and was previously scored as empty 0% without calling the model.
+        if (
+            reason != "force"
+            and recognized_hint is None
+            and not self._pcm_has_stt_energy(samples)
+        ):
+            if reason == "silence_short":
+                self.stt_busy = False
+                self.state = SessionState.LISTENING
+                return [self._listening_event(cleared=False)]
+            if reason == "silence":
+                return self._abandon_incomplete_attempt()
+            self.vad.reset()
             return []
 
         self.state = SessionState.ASSESSING
         self.stt_busy = True
-        self.attempt += 1
         events: list[dict[str, Any]] = []
         audio_ms = int(1000.0 * len(samples) / self.config.sample_rate)
-        t0 = time.perf_counter()
+        transcription: Transcription | None = None
 
-        try:
-            recognized = self.recognizer.transcribe_audio(
-                samples, self.config.sample_rate
-            )
-            stt_ms = int((time.perf_counter() - t0) * 1000)
-        except Exception:
-            logger.exception("final STT failed session=%s", self.session_id)
-            self.stt_busy = False
-            self.state = SessionState.LISTENING
-            return [
-                self.error_event(
-                    "stt_unavailable",
-                    "Speech model unavailable",
-                    fatal=True,
+        if recognized_hint is not None:
+            stt_ms = 0
+            if self._last_stt is not None and self._last_stt.text == recognized_hint:
+                transcription = self._last_stt
+            else:
+                transcription = self._recover_heard(
+                    transcription_from_plain_text(recognized_hint)
                 )
-            ]
+            recognized = (transcription.text if transcription else recognized_hint) or ""
+        else:
+            t0 = time.perf_counter()
+            try:
+                transcription = self.recognizer.transcribe_audio_detailed(
+                    samples,
+                    self.config.sample_rate,
+                    threshold=self.config.threshold,
+                )
+                transcription = self._recover_heard(transcription)
+                recognized = transcription.text or ""
+                self._last_stt = transcription
+                stt_ms = int((time.perf_counter() - t0) * 1000)
+                self._record_stt_ms(stt_ms)
+            except Exception:
+                logger.exception("final STT failed session=%s", self.session_id)
+                self.stt_busy = False
+                self.state = SessionState.LISTENING
+                return [
+                    self.error_event(
+                        "stt_unavailable",
+                        "Speech model unavailable",
+                        fatal=True,
+                    )
+                ]
 
         expected_ayah = self.quran.get_ayah(self.current_surah, self.current_ayah)
         expected_text = expected_ayah["text"] if expected_ayah else ""
         assessor = MemorizationAssessor(threshold=self.config.threshold)
+
+        coverage = (
+            assessor.progress(expected_text, recognized or "")
+            if expected_text
+            else 0.0
+        )
+
+        # Short pause after a complete ayah → score right away (~400 ms).
+        # Keep the buffer: a breath between words is not a restart.
+        # Do not re-arm VAD short-silence here — continued pause must reach
+        # long silence so incomplete ayahs are not stuck at a 50% partial.
+        if reason == "silence_short" and expected_text:
+            if coverage < settings.STREAM_COVERAGE_THRESHOLD:
+                self.stt_busy = False
+                self.state = SessionState.LISTENING
+                events = []
+                if self.config.partials and (recognized or "").strip():
+                    events.extend(
+                        self._partial_events_from_recognized(
+                            recognized or "",
+                            stt_ms=stt_ms,
+                            transcription=transcription,
+                        )
+                    )
+                events.append(self._listening_event(cleared=False))
+                return events
+
+        # Long silence + incomplete ayah → user stopped; drop audio so retry
+        # is not glued onto the failed take (no overlap).
+        if reason == "silence" and expected_text:
+            if coverage < settings.STREAM_COVERAGE_THRESHOLD:
+                return self._abandon_incomplete_attempt()
+
+        # Empty Heard is "no speech / filtered", not a memorization error.
+        # Long-silence abandon clears the buffer; Check now on leftover quiet
+        # PCM must not paint Score 0% with no Heard.
+        if reason == "force" and not (recognized or "").strip():
+            return self._no_speech_events(cleared=False)
+
+        self.attempt += 1
         result = assessor.assess(expected_text, recognized or "")
 
         stats = self._ensure_stats(self.current_surah, self.current_ayah)
@@ -549,33 +924,54 @@ class StreamSession:
         elif not result.passed and self.config.fail_policy == "continue":
             will_advance = True
 
-        events.append(
-            self.base_event(
-                "ayah.result",
-                surah=self.current_surah,
-                ayah=self.current_ayah,
-                attempt=self.attempt,
-                score=result.score,
-                passed=result.passed,
-                warning=result.warning,
-                expected=result.expected,
-                recognized=result.recognized,
-                missing_words=result.missing_words,
-                extra_words=result.extra_words,
-                wrong_words=result.wrong_words,
-                alignment=result.alignment,
-                message=result.message,
-                will_advance=will_advance,
-                audio_ms=audio_ms,
-                stt_ms=stt_ms,
-                trigger=reason,
-            )
+        result_event = self.base_event(
+            "ayah.result",
+            surah=self.current_surah,
+            ayah=self.current_ayah,
+            attempt=self.attempt,
+            score=result.score,
+            passed=result.passed,
+            warning=result.warning,
+            expected=result.expected,
+            recognized=result.recognized,
+            missing_words=result.missing_words,
+            extra_words=result.extra_words,
+            wrong_words=result.wrong_words,
+            alignment=result.alignment,
+            message=result.message,
+            will_advance=will_advance,
+            audio_ms=audio_ms,
+            stt_ms=stt_ms,
+            trigger=reason,
+            coverage=round(coverage, 4),
         )
+        if (
+            transcription is not None
+            and transcription.scored
+            and settings.STT_CONFIDENCE_FILTER
+        ):
+            result_event["sequence_confidence"] = round(
+                transcription.sequence_confidence, 4
+            )
+            result_event["stt_words"] = stt_words_payload(transcription)
+        if transcription is not None:
+            result_event.update(recovery_debug_fields(transcription))
+        events.append(result_event)
 
-        # Clear buffer after final (keep small overlap).
-        self.buffer.clear(keep_overlap_ms=settings.STREAM_OVERLAP_MS)
+        # Keep overlap only on pass-advance. Retry of a failed (esp. short)
+        # ayah must not glue 300 ms of the previous take onto the next try.
+        if result.passed:
+            self.buffer.clear(keep_overlap_ms=settings.STREAM_OVERLAP_MS)
+        elif self.config.fail_policy == "retry":
+            self.buffer.clear(keep_overlap_ms=0.0)
+            self._last_stt = None
+        else:
+            self.buffer.clear(keep_overlap_ms=settings.STREAM_OVERLAP_MS)
         self.vad.reset()
         self.stt_busy = False
+        self._coverage_streak = 0
+        self._stt_queued = False
+        self._pending_assess = None
 
         if result.passed and self.config.auto_advance:
             events.extend(self._advance(reason="passed"))
@@ -631,6 +1027,10 @@ class StreamSession:
         self.current_surah, self.current_ayah = nxt
         self.index_in_session += 1
         self.attempt = 0
+        self._coverage_streak = 0
+        self._stt_queued = False
+        self._pending_assess = None
+        self._last_stt = None
         self._ensure_stats(self.current_surah, self.current_ayah)
         self.state = SessionState.LISTENING
 

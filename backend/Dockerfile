@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/models/huggingface \
-    TRANSFORMERS_CACHE=/models/huggingface
+    HF_HUB_CACHE=/models/huggingface/hub
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \

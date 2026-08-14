@@ -29,17 +29,38 @@ class Settings(BaseSettings):
 
     # Realtime WebSocket stream (Phase 2) — tuned for low CPU.
     STREAM_SILENCE_MS: int = 800
+    STREAM_SHORT_SILENCE_MS: int = 400
     STREAM_MIN_UTTERANCE_MS: int = 400
     STREAM_PARTIAL_EVERY_MS: int = 2000
+    STREAM_COMPLETION_PROBE: bool = True
+    STREAM_COMPLETION_PROBE_MS: int = 1000
     STREAM_COVERAGE_THRESHOLD: float = 0.85
+    # Coverage probe must see ≥ this many consecutive high-coverage ticks
+    # before auto-finalize (mid-utterance STT on short ayahs is unstable).
+    STREAM_COVERAGE_STABLE_TICKS: int = 2
     STREAM_OVERLAP_MS: int = 300
     STREAM_IDLE_TIMEOUT_S: int = 60
     STREAM_MAX_SESSION_S: int = 1800
     STREAM_MAX_BUFFER_S: float = 45.0
     STREAM_MAX_FRAME_BYTES: int = 256 * 1024
     STREAM_MAX_CONCURRENT_SESSIONS: int = 2
-    STREAM_PARTIALS_DEFAULT: bool = False
+    STREAM_PARTIALS_DEFAULT: bool = True
     STREAM_VAD_RMS_THRESHOLD: float = 0.015
+    # STT energy gate (periodic + auto-assess). Lower than VAD so quiet mics
+    # with AGC off / neural denoise still get transcribed.
+    STREAM_STT_RMS_THRESHOLD: float = 0.008
+
+    # STT confidence filter (Heard word-keep floor is Accuracy T / DEFAULT_THRESHOLD).
+    STT_CONFIDENCE_FILTER: bool = True
+    STT_SEQUENCE_CONFIDENCE_MIN: float = 0.50
+    STT_MAX_NEW_TOKENS: int = 64
+    STT_PARTIAL_MAX_OVERGEN_RATIO: float = 2.0
+    # Lab 2026-08-14: Tiny greedy softmax is not on the Accuracy-slider scale.
+    # p**gamma maps typical speech (~0.28+) to ≥0.85 and screenshot garbage (~0.12–0.22) below.
+    STT_DECODER_PROB_GAMMA: float = 0.12
+    # Ayah-constrained Heard recovery (Uthmani↔STT / agglutination / in-vocab revive).
+    STT_AYAH_LEXICON_RECOVERY: bool = True
+    STT_INVOCAB_FLOOR: float = 0.55
 
     # NoDecode: env values like "*" or "a,b" must not be JSON-parsed first.
     CORS_ORIGINS: Annotated[list[str], NoDecode] = ["*"]

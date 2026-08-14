@@ -40,11 +40,7 @@ Hot-reload developer stack:
 docker compose -f docker-compose.dev.yml up --build
 ```
 
-First assess may take a while while the ~112 MB speech model downloads into the `hf_cache` volume. Set `PREFETCH_MODEL=1` to download at container start:
-
-```bash
-PREFETCH_MODEL=1 docker compose up --build
-```
+The Moonshine STT model (~112 MB) is **prefetched** on first `up` into the named volume `hf_cache` (`/models/huggingface`). Later starts reuse it; they do not re-download. Wipe with `docker compose down -v` only if you intend to drop the corpus and model cache.
 
 ## Quick start (local venv)
 
@@ -93,7 +89,7 @@ Manifests live in [`k8s/`](k8s/). Build and load images into your cluster, then:
 kubectl apply -f k8s/deploy.yaml
 ```
 
-See [`k8s/README.md`](k8s/README.md) for kind/minikube notes. PVCs hold the Quran JSON and Hugging Face model cache. The frontend nginx image proxies `/api` and `/health` to the `backend` Service.
+See [`k8s/README.md`](k8s/README.md) for kind/minikube notes. PVCs hold the Quran JSON (`quran-data`) and the Moonshine cache (`hf-model-cache`); an init container prefetches the STT weights before the API starts. The frontend nginx image proxies `/api` and `/health` to the `backend` Service.
 
 ## Corpus provenance
 

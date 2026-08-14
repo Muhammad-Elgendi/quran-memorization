@@ -32,12 +32,9 @@ def main() -> None:
     print("\nDownloading Quran corpus...")
     run([sys.executable, str(ROOT / "backend" / "download_quran.py")])
 
-    print("\nPrefetching Moonshine Arabic Tiny (optional; also loads on first use)...")
+    print("\nPrefetching Moonshine Arabic Tiny into the Hugging Face cache...")
     try:
-        from huggingface_hub import snapshot_download
-
-        snapshot_download(repo_id="UsefulSensors/moonshine-tiny-ar")
-        print("Model prefetch complete.")
+        run([sys.executable, str(ROOT / "backend" / "prefetch_model.py")])
     except Exception as exc:  # noqa: BLE001
         print(f"Model prefetch skipped ({exc}). It will download on first assess.")
 

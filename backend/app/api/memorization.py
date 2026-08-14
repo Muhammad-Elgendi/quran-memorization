@@ -9,6 +9,11 @@ from ..services.assessor import MemorizationAssessor
 from ..services.audio import prepare_audio
 from ..services.quran_service import QuranService
 from ..services.speech_service import MoonshineArabicRecognizer, SpeechRecognizer
+from ..services.stt_confidence import (
+    apply_ayah_recovery,
+    recovery_debug_fields,
+    stt_words_payload,
+)
 
 ALLOWED_SUFFIXES = {".webm", ".wav", ".ogg", ".mp3", ".m4a", ".flac"}
 
@@ -97,20 +102,23 @@ def create_router(
                 )
 
             try:
-                recognized = speech.transcribe(analyzable_path)
+                transcription = speech.transcribe_detailed(
+                    analyzable_path, threshold=threshold
+                )
             except Exception as exc:
                 raise HTTPException(
                     status_code=503,
                     detail="Speech model unavailable",
                 ) from exc
 
+            transcription = apply_ayah_recovery(target["text"], transcription)
             assessor = MemorizationAssessor(threshold=threshold)
             result = assessor.assess(
                 expected=target["text"],
-                recognized=recognized or "",
+                recognized=transcription.text or "",
             )
 
-            return {
+            payload = {
                 "score": result.score,
                 "passed": result.passed,
                 "warning": result.warning,
@@ -122,6 +130,13 @@ def create_router(
                 "message": result.message,
                 "alignment": result.alignment,
             }
+            if transcription.scored and settings.STT_CONFIDENCE_FILTER:
+                payload["sequence_confidence"] = round(
+                    transcription.sequence_confidence, 4
+                )
+                payload["stt_words"] = stt_words_payload(transcription)
+            payload.update(recovery_debug_fields(transcription))
+            return payload
         finally:
             if owns_analyzable and analyzable_path:
                 Path(analyzable_path).unlink(missing_ok=True)

@@ -580,7 +580,8 @@ cd frontend && npm install && npm run dev
 ### Phase 3 — Quran-tuned ASR
 
 - [ ] Evaluate / fine-tune on Quran-Ayah-Corpus (or similar)
-- [ ] Optional post-STT “Quran lexicon correction” constrained to expected ayah vocabulary
+- [x] Optional post-STT ayah-constrained Heard recovery (agglutination + in-vocab revive; `uthmani-tanzeel-word-matching-spec.md` P0)
+- [ ] Full Quran-tuned lexicon / ASR correction (remaining Phase 3)
 - [ ] Swap recognizer implementation without API changes
 
 ---

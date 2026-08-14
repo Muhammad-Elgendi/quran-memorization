@@ -87,6 +87,96 @@ def test_assess_threshold_boundary():
     assert result.score == 1.0
 
 
+def test_assess_restart_from_beginning():
+    """Restarting mid-ayah should score the best suffix, not penalize duplicates."""
+    expected = "الحمد لله رب العالمين"
+    recognized = "الحمد لله الحمد لله رب العالمين"
+    result = MemorizationAssessor(threshold=0.85).assess(expected, recognized)
+    assert result.passed
+    assert result.score >= 0.85
+
+
+def test_progress_uses_best_suffix():
+    assessor = MemorizationAssessor()
+    expected = "الحمد لله رب العالمين"
+    partial = "الحمد لله"
+    full_with_restart = "الحمد لله الحمد لله رب العالمين"
+    assert assessor.progress(expected, partial) == pytest.approx(2 / 4)
+    assert assessor.progress(expected, full_with_restart) == pytest.approx(1.0)
+
+
+# --- Coverage vs STT-like simple Arabic (ayah-advance-fix-spec §10.1) ---
+
+
+def test_progress_fatihah_1_2_stt_like_full(quran_service: QuranService):
+    """A1: dagger-alef seat mismatch must still count as coverage complete."""
+    expected = quran_service.get_ayah(1, 2)["text"]
+    recognized = "الحمد لله رب العالمين"
+    assessor = MemorizationAssessor(threshold=0.85)
+    assert assessor.progress(expected, recognized) == pytest.approx(1.0)
+
+
+def test_assess_fatihah_1_2_stt_like_passes(quran_service: QuranService):
+    """A2: same pair would pass the accuracy threshold once finalized."""
+    expected = quran_service.get_ayah(1, 2)["text"]
+    recognized = "الحمد لله رب العالمين"
+    result = MemorizationAssessor(threshold=0.85).assess(expected, recognized)
+    assert result.passed
+    assert result.score >= 0.85
+    assert result.wrong_words == []
+
+
+def test_progress_fatihah_1_2_mid_ayah_blocked(quran_service: QuranService):
+    """A3 / G4: partial recitation must stay below the coverage gate."""
+    expected = quran_service.get_ayah(1, 2)["text"]
+    recognized = "الحمد لله"
+    progress = MemorizationAssessor().progress(expected, recognized)
+    assert progress == pytest.approx(0.5)
+    assert progress < 0.85
+
+
+def test_progress_fatihah_1_4_stt_like(quran_service: QuranService):
+    """A4: مالك vs ملك (dagger alef) counts as matched."""
+    expected = quran_service.get_ayah(1, 4)["text"]
+    assert MemorizationAssessor().progress(expected, "مالك يوم الدين") == pytest.approx(
+        1.0
+    )
+
+
+def test_progress_fatihah_1_6_stt_like(quran_service: QuranService):
+    """A5: الصراط vs الصرط counts as matched."""
+    expected = quran_service.get_ayah(1, 6)["text"]
+    assert MemorizationAssessor().progress(
+        expected, "اهدنا الصراط المستقيم"
+    ) == pytest.approx(1.0)
+
+
+def test_progress_fatihah_1_1_rahman_not_broken(quran_service: QuranService):
+    """A6: must not regress الرحمن (blind U+0670→ا would break this)."""
+    expected = quran_service.get_ayah(1, 1)["text"]
+    assert MemorizationAssessor().progress(
+        expected, "بسم الله الرحمن الرحيم"
+    ) == pytest.approx(1.0)
+
+
+def test_progress_fatihah_1_2_restart_suffix(quran_service: QuranService):
+    """A7: best-suffix still finds the complete ayah after a restart."""
+    expected = quran_service.get_ayah(1, 2)["text"]
+    recognized = "الحمد لله الحمد لله رب العالمين"
+    assert MemorizationAssessor().progress(expected, recognized) == pytest.approx(1.0)
+
+
+def test_progress_fatihah_1_2_near_miss_documented(quran_service: QuranService):
+    """A8: العليين≈العلمين (85.7%) counts at WORD_MATCH_THRESHOLD=0.75.
+
+    A stricter COVERAGE_WORD_THRESHOLD (e.g. 0.90) would prefer progress < 0.85;
+    that split is deferred (spec §7 / open question 2).
+    """
+    expected = quran_service.get_ayah(1, 2)["text"]
+    progress = MemorizationAssessor().progress(expected, "الحمد لله رب العليين")
+    assert progress == pytest.approx(1.0)
+
+
 # --- QuranService ---
 
 
@@ -157,6 +247,54 @@ def test_assess_with_mock(api_client: TestClient, tmp_path: Path):
     assert "score" in body
     assert "passed" in body
     assert "wrong_words" in body
+
+
+def test_assess_filters_low_confidence_garbage(
+    quran_service: QuranService, tmp_path: Path
+):
+    recognizer = MockSpeechRecognizer(
+        transcript="يا كلب دعياة لست عينا يا كلب دعيا كلا استعين",
+        word_confidences=[0.15, 0.12, 0.20, 0.18, 0.22, 0.14, 0.11, 0.19, 0.16, 0.88],
+        sequence_confidence=0.70,
+    )
+    app = FastAPI()
+    app.include_router(
+        create_memorization_router(quran_service, recognizer=recognizer)
+    )
+    client = TestClient(app)
+    wav = _write_wav(tmp_path / "sample.wav", seconds=1.0)
+    with wav.open("rb") as f:
+        response = client.post(
+            "/api/memorization/assess",
+            data={"surah": "1", "ayah": "5", "threshold": "0.85"},
+            files={"audio": ("sample.wav", f, "audio/wav")},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert "كلب" not in body["recognized"]
+    assert "يا" not in body["recognized"].split()
+
+
+def test_assess_empty_filtered_is_fail_200(
+    quran_service: QuranService, tmp_path: Path
+):
+    recognizer = MockSpeechRecognizer(transcript="")
+    app = FastAPI()
+    app.include_router(
+        create_memorization_router(quran_service, recognizer=recognizer)
+    )
+    client = TestClient(app)
+    wav = _write_wav(tmp_path / "sample.wav", seconds=1.0)
+    with wav.open("rb") as f:
+        response = client.post(
+            "/api/memorization/assess",
+            data={"surah": "1", "ayah": "1", "threshold": "0.85"},
+            files={"audio": ("sample.wav", f, "audio/wav")},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["passed"] is False
+    assert body["recognized"] == ""
 
 
 def test_assess_unknown_ayah(api_client: TestClient, tmp_path: Path):

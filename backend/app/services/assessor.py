@@ -40,7 +40,69 @@ class MemorizationAssessor:
             else word_match_threshold
         )
 
+    def progress(self, expected: str, recognized: str) -> float:
+        """Fraction of expected tokens matched (0–1), best over recognized suffixes."""
+        expected_words = tokenize(expected)
+        if not expected_words:
+            return 0.0
+        rec_words = tokenize(recognized)
+        if not rec_words:
+            return 0.0
+        best = 0.0
+        for start in range(len(rec_words)):
+            ratio = self._token_match_ratio(expected_words, rec_words[start:])
+            best = max(best, ratio)
+        return best
+
+    def _token_match_ratio(
+        self,
+        expected_words: list[str],
+        recognized_words: list[str],
+    ) -> float:
+        """Fraction of expected tokens heard (exact or fuzzy replace).
+
+        Mirrors ``_assess_direct`` pairing: ``equal`` opcodes count fully;
+        ``replace`` pairs count when ``fuzz.ratio >= word_match_threshold``.
+        Unpaired expected words in a replace slice stay unmatched; inserts
+        do not increase coverage.
+        """
+        if not expected_words:
+            return 0.0
+        matcher = SequenceMatcher(
+            None, expected_words, recognized_words, autojunk=False
+        )
+        matched = 0
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                matched += i2 - i1
+            elif tag == "replace":
+                paired = min(i2 - i1, j2 - j1)
+                for k in range(paired):
+                    similarity = (
+                        fuzz.ratio(
+                            expected_words[i1 + k],
+                            recognized_words[j1 + k],
+                        )
+                        / 100.0
+                    )
+                    if similarity >= self.word_match_threshold:
+                        matched += 1
+        return matched / len(expected_words)
+
     def assess(self, expected: str, recognized: str) -> AssessmentResult:
+        rec_words = tokenize(recognized)
+        if len(rec_words) <= 1:
+            return self._assess_direct(expected, recognized)
+
+        best = self._assess_direct(expected, recognized)
+        for start in range(1, len(rec_words)):
+            suffix = " ".join(rec_words[start:])
+            candidate = self._assess_direct(expected, suffix)
+            if candidate.score > best.score:
+                best = candidate
+        return best
+
+    def _assess_direct(self, expected: str, recognized: str) -> AssessmentResult:
         expected_normalized = normalize_arabic(expected)
         recognized_normalized = normalize_arabic(recognized)
 
