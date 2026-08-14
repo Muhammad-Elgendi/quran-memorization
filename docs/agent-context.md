@@ -6,7 +6,7 @@
 - Phase 1 REST: `specs/implementation-spec.md`
 - Phase 2 stream: `specs/realtime-stream-spec.md`
 
-**Last updated:** 2026-08-14 (Continuous empty-0% / quiet-mic STT gate)
+**Last updated:** 2026-08-14 (Continuous mistake warning tone on long-silence fail)
 
 ---
 
@@ -37,7 +37,8 @@ Local-first Quran memorization assessor:
     - `STREAM_VAD_RMS_THRESHOLD` (0.015) — speech vs silence for utterance boundaries.
     - `STREAM_STT_RMS_THRESHOLD` (0.008) — whether periodic / auto STT is worth calling (quieter; AGC-off + denoise often sits under the VAD floor).
     - **`ayah.force_assess` (Check now) always runs STT** when the buffer has ≥ `STREAM_MIN_UTTERANCE_MS` of audio — it does **not** use the energy short-circuit. Empty Heard → soft `error.code=no_speech` + `session.listening`, **not** `ayah.result` Score 0%.
-11. **Incomplete long silence** clears the ring buffer (no overlap) so a retry is not glued onto a failed take. Short silence with low coverage keeps the buffer and emits `session.listening`.
+11. **Incomplete long silence:** non-empty Heard below coverage **scores** (`ayah.result` fail + `fail_policy`) so the client can play the warning tone once. Character score ≥ 85% does **not** pass-advance until coverage also clears 0.85 (avoids Basmala-without-`بسم` false advance). Empty Heard still abandons (clear UI, no fail / no tone). Short silence with low coverage keeps the buffer and emits `session.listening`.
+12. **Mistake warning tone:** Continuous plays the Phase 1 660 Hz cue **once** per `(surah, ayah, attempt)` on `ayah.result` fail, reusing the live capture `AudioContext` so it is audible while the mic is on (`frontend/src/audio/warning-tone.js`). See `specs/continuous-mistake-tone-spec.md`.
 
 **Still out of scope:** tajweed, accounts/progress DB, Quran-fine-tuned ASR, leftover-carry for pause-less tilawah (v1.1), multi-replica sticky sessions.
 
@@ -72,6 +73,7 @@ quran-memorization/
 ├── frontend/                          # Vue 3 + Vite + axios
 │   ├── public/pcm-worklet.js          # 16 kHz PCM capture worklet
 │   ├── src/stream.js                  # WS URL + PCM capture helper
+│   ├── src/audio/warning-tone.js      # 660 Hz fail cue (reuse capture AudioContext)
 │   ├── src/App.vue                    # single + continuous modes
 │   ├── Dockerfile
 │   └── nginx.conf                     # /api proxy + WebSocket upgrade
@@ -300,6 +302,7 @@ cd backend && pytest -q
 | Continuous 1:1 stuck at 75%; dashed `بِسْمِ`; Heard missing `بسم` | Confidence filter dropped a weak first token, and/or STT glued `بسمالله` | `recover_against_ayah` after filter: in-vocab revive (≥0.55) + agglutination split; do not invent missing decode tokens (`specs/uthmani-tanzeel-word-matching-spec.md`) |
 | Continuous 1:3 live ~50%, `ٱلرَّحِيمِ` red, no advance (Single still passes) | Mid-utterance periodic STT + short-silence re-arm stalled long silence; UI treated provisional partial as hard fail | Stable coverage ticks (2); provisional chips; long silence → pass / fail / `session.listening` (cleared); audio kept while STT busy (`specs/continuous-vs-single-detection-spec.md`) |
 | Continuous “detection dead”: Score **0%**, Recognized empty, all words missing after Check now / pause | (1) Long-silence abandon cleared buffer; quiet leftover PCM failed `pcm_has_speech` at VAD floor; force scored empty as memorization fail. (2) Periodic STT used the same strict VAD RMS, so AGC-off/DTLN speech never transcribed | Force always STTs (≥ min utterance); empty Heard → `no_speech` + listening, not `ayah.result`; `STREAM_STT_RMS_THRESHOLD=0.008` for periodic/auto gates |
+| Continuous recites with mistakes, no warning tone | Coverage gate blocked `ayah.result` on incomplete takes; `playWarning()` used a fresh `AudioContext` under live capture | Long silence + non-empty Heard scores a fail result; client reuses capture context + once-per-attempt (`specs/continuous-mistake-tone-spec.md`) |
 
 **Log signature for the WebM bug:**
 

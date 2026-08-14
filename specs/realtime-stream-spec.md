@@ -568,6 +568,7 @@ STREAM_MAX_SESSION_S=1800
 - **VAD RMS** segments speech vs silence.
 - **STT RMS** (lower) decides whether automatic periodic STT is worth calling. Check now ignores this gate (see `ayah.force_assess` above).
 - **Stable ticks** require consecutive high-coverage probes before auto-finalize (avoids mid-word `ayah.result` on short ayahs).
+- **Long silence below coverage:** if Heard is **non-empty**, emit `ayah.result` (typically fail) and apply `fail_policy` so the client can play the mistake tone. Empty Heard still abandons without scoring. **Short silence** below coverage never finalizes (breath between words). See [`continuous-mistake-tone-spec.md`](continuous-mistake-tone-spec.md).
 
 ---
 
@@ -707,7 +708,7 @@ On stop/close/error:
    - Show current ayah text prominently
    - Start mic → stream PCM chunks
    - On `partial.alignment`: highlight words live
-   - On `ayah.result`: show score toast; play warning tone if `warning` (reuse Phase 1 tone)
+   - On `ayah.result`: show score toast; play the Phase 1 warning tone **once per attempt** if `warning` / `!passed`, using the **live capture** `AudioContext` so it is audible while the mic is on. Do not beep on `session.waiting`. See [`continuous-mistake-tone-spec.md`](continuous-mistake-tone-spec.md).
    - On `session.advance`: update displayed ayah; optional subtle transition
    - Stop button → `session.stop` → show summary panel
 

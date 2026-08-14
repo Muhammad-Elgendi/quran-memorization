@@ -8,6 +8,7 @@ import {
 } from "./stream";
 import { describeDenoiseMode } from "./audio/capture-service";
 import { heardTextFromMessage, wordsFromAlignment } from "./highlight";
+import { createAttemptWarner, playWarningTone } from "./audio/warning-tone";
 
 const labTrace =
   typeof window !== "undefined" &&
@@ -46,6 +47,8 @@ let audioChunks = [];
 let ws = null;
 let pcmCapture = null;
 let processedCapture = null;
+let captureAudioContext = null;
+const attemptWarner = createAttemptWarner();
 
 const isContinuous = computed(() => mode.value === "continuous");
 const continuousBusy = computed(() => sessionActive.value || micActive.value);
@@ -106,16 +109,8 @@ async function loadSurahs() {
   }
 }
 
-function playWarning() {
-  const audioContext = new AudioContext();
-  const oscillator = audioContext.createOscillator();
-  const gain = audioContext.createGain();
-  oscillator.connect(gain);
-  gain.connect(audioContext.destination);
-  oscillator.frequency.value = 660;
-  gain.gain.value = 0.2;
-  oscillator.start();
-  oscillator.stop(audioContext.currentTime + 0.3);
+function warnFromResult(msg) {
+  attemptWarner.maybeWarn(msg, { audioContext: captureAudioContext });
 }
 
 // --- Single (REST) ------------------------------------------------------
@@ -193,7 +188,7 @@ async function uploadRecording() {
     const response = await api.post("/api/memorization/assess", formData);
     result.value = response.data;
     if (result.value.warning || !result.value.passed) {
-      playWarning();
+      void playWarningTone({ audioContext: captureAudioContext });
     }
   } catch (err) {
     const detail = err.response?.data?.detail;
@@ -238,6 +233,7 @@ function handleStreamMessage(msg) {
       sessionId.value = msg.session_id;
       currentAyah.value = msg.current;
       sessionActive.value = true;
+      attemptWarner.reset();
       clearLiveHighlights();
       status.value = `Ready — ${msg.current.surah}:${msg.current.ayah}. Press Start Recitation.`;
       break;
@@ -278,7 +274,7 @@ function handleStreamMessage(msg) {
         liveSequenceConfidence.value = msg.sequence_confidence;
       }
       if (msg.warning || !msg.passed) {
-        playWarning();
+        warnFromResult(msg);
       }
       status.value = msg.passed
         ? `Passed ${msg.surah}:${msg.ayah} (${Math.round(msg.score * 100)}%)`
@@ -286,6 +282,7 @@ function handleStreamMessage(msg) {
       break;
     case "session.advance":
       currentAyah.value = msg.to;
+      attemptWarner.reset();
       clearLiveHighlights();
       status.value = micActive.value
         ? `Listening — ${msg.to.surah}:${msg.to.ayah}`
@@ -308,6 +305,8 @@ function handleStreamMessage(msg) {
       sessionSummary.value = msg;
       status.value = "Session ended.";
       sessionActive.value = false;
+      attemptWarner.reset();
+      captureAudioContext = null;
       clearLiveHighlights();
       break;
     case "error":
@@ -443,6 +442,7 @@ async function startMic() {
         stopMic();
       },
     });
+    captureAudioContext = pcmCapture.audioContext || null;
     micActive.value = true;
     const cur = currentAyah.value;
     const denoiseHint = pcmCapture.fallbackUsed
@@ -460,6 +460,8 @@ async function startMic() {
 
 async function stopMic() {
   micActive.value = false;
+  captureAudioContext = null;
+  attemptWarner.reset();
   if (pcmCapture) {
     try {
       await pcmCapture.stop();

@@ -202,35 +202,80 @@ def test_session_fail_continue_and_stop(quran_service: QuranService):
     assert any(e["type"] == "session.summary" and e["reason"] == "fail_stop" for e in events2)
 
 
-def test_session_silence_skips_assess_when_coverage_low(quran_service: QuranService):
-    """Long silence on an incomplete ayah must not finalize; it drops the buffer."""
-    ayah1 = quran_service.get_ayah(1, 1)["text"]
-    # Only first few words — well below coverage threshold.
-    partial = " ".join(ayah1.split()[:2])
-    recognizer = MockSpeechRecognizer(transcript=partial)
+def test_long_silence_nonempty_low_coverage_emits_fail_result(
+    quran_service: QuranService,
+):
+    """Long silence + wrong Heard below coverage → one ayah.result fail + waiting."""
+    recognizer = MockSpeechRecognizer(transcript="الرحمن يضحين")
     cfg = StreamSessionConfig(
         start_surah=1,
-        start_ayah=1,
+        start_ayah=3,
         end_surah=1,
-        end_ayah=3,
+        end_ayah=7,
         threshold=0.85,
-        fail_policy="continue",
+        fail_policy="retry",
+        auto_advance=True,
         partials=False,
     )
     session = StreamSession(quran_service, recognizer, cfg)
     session.ready_event()
     session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
     events = session.run_assess(reason="silence")
-    types = [e["type"] for e in events]
-    assert "ayah.result" not in types
-    assert "session.advance" not in types
-    assert session.current_ayah == 1
-    assert session.state.value == "listening"
-    assert session.attempt == 0
+    results = [e for e in events if e["type"] == "ayah.result"]
+    assert len(results) == 1
+    result = results[0]
+    assert result["passed"] is False
+    assert result["warning"] is True
+    assert result["trigger"] == "silence"
+    assert result["coverage"] < settings.STREAM_COVERAGE_THRESHOLD
+    assert session.current_ayah == 3
+    assert session.attempt == 1
+    assert any(e["type"] == "session.waiting" for e in events)
     assert session.buffer.duration_ms == pytest.approx(0, abs=1)
-    assert any(e["type"] == "partial.transcript" and e["recognized"] == "" for e in events)
-    assert any(e["type"] == "partial.alignment" and e["progress"] == 0.0 for e in events)
+
+
+def test_long_silence_empty_heard_no_fail_result(quran_service: QuranService):
+    """Quiet / empty Heard on long silence must abandon, not score a fail."""
+    recognizer = MockSpeechRecognizer(transcript="")
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        threshold=0.85,
+        fail_policy="retry",
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="silence")
+    assert not any(e["type"] == "ayah.result" for e in events)
     assert any(e["type"] == "session.listening" and e.get("cleared") for e in events)
+    assert session.attempt == 0
+    assert session.current_ayah == 1
+    assert session.buffer.duration_ms == pytest.approx(0, abs=1)
+
+
+def test_fail_result_includes_alignment_wrong_words(quran_service: QuranService):
+    """Classic replace on long silence still ships highlight payload."""
+    recognizer = MockSpeechRecognizer(transcript="الرحمن يضحين")
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=3,
+        threshold=0.85,
+        fail_policy="retry",
+        auto_advance=True,
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="silence")
+    result = next(e for e in events if e["type"] == "ayah.result")
+    assert result["passed"] is False
+    assert result["alignment"]
+    assert result["wrong_words"] or result["missing_words"]
+    ops = {op["op"] for op in result["alignment"]}
+    assert "replace" in ops or "delete" in ops
 
 
 def test_session_silence_short_assesses_when_coverage_high(quran_service: QuranService):
@@ -348,7 +393,7 @@ def test_session_stt_like_1_2_silence_advances(quran_service: QuranService):
 
 
 def test_session_stt_like_1_2_mid_ayah_blocked(quran_service: QuranService):
-    """S3: mid-ayah STT must not probe-finalize or silence-finalize."""
+    """S3: mid-ayah STT must not probe-finalize; short silence must not fail."""
     recognizer = MockSpeechRecognizer(transcript="الحمد لله")
     cfg = StreamSessionConfig(
         start_surah=1,
@@ -368,11 +413,11 @@ def test_session_stt_like_1_2_mid_ayah_blocked(quran_service: QuranService):
     assert not any(e.get("type") == "_assess_trigger" for e in probe)
 
     session.buffer.append_pcm_s16le(_pcm_tone(200, amp=0.2))
-    silence_events = session.run_assess(reason="silence")
-    assert not any(e["type"] == "ayah.result" for e in silence_events)
-    assert session.buffer.duration_ms == pytest.approx(0, abs=1)
-    assert session.run_assess(reason="silence_short") == []
+    short = session.run_assess(reason="silence_short")
+    assert not any(e["type"] == "ayah.result" for e in short)
     assert session.current_ayah == 2
+    assert session.attempt == 0
+    assert session.buffer.duration_ms == pytest.approx(700, abs=20)
 
 
 def test_session_fatihah_stt_like_auto_advances_through_range(
@@ -525,7 +570,7 @@ def test_benchmark_ttfr_coverage_probe(quran_service: QuranService, monkeypatch)
     assert ttfr_ms < 2500
 
 
-def test_session_silence_short_skips_when_coverage_low(quran_service: QuranService):
+def test_short_silence_low_coverage_no_fail_result(quran_service: QuranService):
     ayah1 = quran_service.get_ayah(1, 1)["text"]
     partial = " ".join(ayah1.split()[:2])
     recognizer = MockSpeechRecognizer(transcript=partial)
@@ -569,7 +614,9 @@ def test_session_long_silence_clears_buffer_so_retry_is_clean(
     session.ready_event()
     session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
     first = session.run_assess(reason="silence")
-    assert not any(e["type"] == "ayah.result" for e in first)
+    result = next(e for e in first if e["type"] == "ayah.result")
+    assert result["passed"] is False
+    assert any(e["type"] == "session.waiting" for e in first)
     assert session.buffer.duration_ms == pytest.approx(0, abs=1)
     assert session._last_stt is None
 
@@ -1065,7 +1112,11 @@ def test_s2_screenshot_heard_does_not_invent_or_advance(quran_service: QuranServ
     assert not any(e.get("type") == "_assess_trigger" for e in events)
     session.buffer.append_pcm_s16le(_pcm_tone(200, amp=0.2))
     silence_events = session.run_assess(reason="silence")
-    assert not any(e["type"] == "ayah.result" for e in silence_events)
+    assert not any(e["type"] == "session.advance" for e in silence_events)
+    result = next(e for e in silence_events if e["type"] == "ayah.result")
+    assert result["passed"] is False
+    assert "بسم" not in result["recognized"].split()
+    assert "بسم" in result["missing_words"]
     assert session.current_ayah == 1
     assert session.buffer.duration_ms == pytest.approx(0, abs=1)
 
@@ -1246,10 +1297,10 @@ def test_overlap_only_after_fail_does_not_stt(quran_service: QuranService):
     assert recognizer.calls == 1
 
 
-def test_incomplete_1_3_pause_emits_listening_not_stall(
+def test_incomplete_1_3_pause_emits_fail_result_not_stall(
     quran_service: QuranService,
 ):
-    """After ≥800 ms pause on a 50% 1:3, session.listening (cleared), not a silent stall."""
+    """After ≥800 ms pause on a 50% 1:3, ayah.result fail + waiting, not a silent stall."""
     recognizer = MockSpeechRecognizer(transcript="الرحمن يضحين")
     cfg = StreamSessionConfig(
         start_surah=1,
@@ -1266,9 +1317,9 @@ def test_incomplete_1_3_pause_emits_listening_not_stall(
     events = _ingest(session, _pcm_tone(600, amp=0.2))
     for _ in range(8):
         events.extend(_ingest(session, _pcm_silence(250)))
-        if any(e.get("type") == "session.listening" and e.get("cleared") for e in events):
+        if any(e.get("type") == "ayah.result" for e in events):
             break
-    assert not any(e["type"] == "ayah.result" for e in events)
-    assert any(e["type"] == "session.listening" and e.get("cleared") for e in events)
+    assert any(e["type"] == "ayah.result" and e["passed"] is False for e in events)
+    assert any(e["type"] == "session.waiting" for e in events)
     assert session.current_ayah == 3
     assert session.buffer.duration_ms == pytest.approx(0, abs=1)

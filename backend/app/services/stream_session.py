@@ -302,7 +302,7 @@ class StreamSession:
         ]
 
     def _abandon_incomplete_attempt(self) -> list[dict[str, Any]]:
-        """Long silence without enough coverage: drop audio so a retry is clean."""
+        """Long silence with empty / no-speech Heard: drop audio so a retry is clean."""
         self.buffer.clear(keep_overlap_ms=0.0)
         self._reset_stream_decode_state()
         self.vad.reset()
@@ -877,6 +877,8 @@ class StreamSession:
             else 0.0
         )
 
+        heard = (recognized or "").strip()
+
         # Short pause after a complete ayah → score right away (~400 ms).
         # Keep the buffer: a breath between words is not a restart.
         # Do not re-arm VAD short-silence here — continued pause must reach
@@ -886,7 +888,7 @@ class StreamSession:
                 self.stt_busy = False
                 self.state = SessionState.LISTENING
                 events = []
-                if self.config.partials and (recognized or "").strip():
+                if self.config.partials and heard:
                     events.extend(
                         self._partial_events_from_recognized(
                             recognized or "",
@@ -897,31 +899,42 @@ class StreamSession:
                 events.append(self._listening_event(cleared=False))
                 return events
 
-        # Long silence + incomplete ayah → user stopped; drop audio so retry
-        # is not glued onto the failed take (no overlap).
-        if reason == "silence" and expected_text:
-            if coverage < settings.STREAM_COVERAGE_THRESHOLD:
+        # Empty Heard is "no speech / filtered", not a memorization error.
+        # Quiet mic / filtered-empty must not paint Score 0%.
+        if not heard:
+            if reason == "force":
+                return self._no_speech_events(cleared=False)
+            if reason == "silence":
                 return self._abandon_incomplete_attempt()
 
-        # Empty Heard is "no speech / filtered", not a memorization error.
-        # Long-silence abandon clears the buffer; Check now on leftover quiet
-        # PCM must not paint Score 0% with no Heard.
-        if reason == "force" and not (recognized or "").strip():
-            return self._no_speech_events(cleared=False)
+        # Long silence + non-empty Heard below coverage: user stopped on a
+        # wrong / incomplete take. Score it (ayah.result fail) so the client
+        # can play the warning tone. Fail+retry still clears the buffer.
 
         self.attempt += 1
         result = assessor.assess(expected_text, recognized or "")
+        # Coverage is the stream completion gate. A high character score on an
+        # unfinished ayah (e.g. Basmala missing بسم) must not pass-advance.
+        passed = result.passed
+        warning = result.warning
+        if (
+            reason == "silence"
+            and expected_text
+            and coverage < settings.STREAM_COVERAGE_THRESHOLD
+        ):
+            passed = False
+            warning = True
 
         stats = self._ensure_stats(self.current_surah, self.current_ayah)
         stats.attempts += 1
         stats.best_score = max(stats.best_score, result.score)
-        if result.passed:
+        if passed:
             stats.passed = True
 
         will_advance = False
-        if result.passed and self.config.auto_advance:
+        if passed and self.config.auto_advance:
             will_advance = True
-        elif not result.passed and self.config.fail_policy == "continue":
+        elif not passed and self.config.fail_policy == "continue":
             will_advance = True
 
         result_event = self.base_event(
@@ -930,8 +943,8 @@ class StreamSession:
             ayah=self.current_ayah,
             attempt=self.attempt,
             score=result.score,
-            passed=result.passed,
-            warning=result.warning,
+            passed=passed,
+            warning=warning,
             expected=result.expected,
             recognized=result.recognized,
             missing_words=result.missing_words,
@@ -960,7 +973,7 @@ class StreamSession:
 
         # Keep overlap only on pass-advance. Retry of a failed (esp. short)
         # ayah must not glue 300 ms of the previous take onto the next try.
-        if result.passed:
+        if passed:
             self.buffer.clear(keep_overlap_ms=settings.STREAM_OVERLAP_MS)
         elif self.config.fail_policy == "retry":
             self.buffer.clear(keep_overlap_ms=0.0)
@@ -973,9 +986,9 @@ class StreamSession:
         self._stt_queued = False
         self._pending_assess = None
 
-        if result.passed and self.config.auto_advance:
+        if passed and self.config.auto_advance:
             events.extend(self._advance(reason="passed"))
-        elif not result.passed and self.config.fail_policy == "retry":
+        elif not passed and self.config.fail_policy == "retry":
             events.append(
                 self.base_event(
                     "session.waiting",
@@ -986,9 +999,9 @@ class StreamSession:
                 )
             )
             self.state = SessionState.LISTENING
-        elif not result.passed and self.config.fail_policy == "continue":
+        elif not passed and self.config.fail_policy == "continue":
             events.extend(self._advance(reason="continue_policy"))
-        elif not result.passed and self.config.fail_policy == "stop":
+        elif not passed and self.config.fail_policy == "stop":
             events.append(self.summary_event("fail_stop"))
         else:
             # passed but auto_advance false

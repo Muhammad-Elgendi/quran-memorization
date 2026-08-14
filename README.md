@@ -104,7 +104,7 @@ See [`k8s/README.md`](k8s/README.md) for kind/minikube notes. PVCs hold the Qura
 - Default pass threshold: **85%** (slider / form override clamped to 50–100%)
 - Word mismatch threshold: **75%**
 - Assessment uses `rapidfuzz` overall similarity plus `difflib.SequenceMatcher` token alignment
-- Failed assessments play a short warning tone in the UI
+- Failed assessments play a short warning tone in the UI (Single REST and Continuous `ayah.result` fail, including a long pause on a wrong / incomplete ayah)
 - Continuous mode streams **16 kHz PCM** (AudioWorklet); silence ends an ayah attempt; partials are **off by default** for CPU
 - Vite proxy and nginx/Ingress support WebSocket upgrade for `/api`
 
@@ -112,6 +112,7 @@ See [`k8s/README.md`](k8s/README.md) for kind/minikube notes. PVCs hold the Qura
 
 - [`specs/implementation-spec.md`](specs/implementation-spec.md) — Phase 1 REST guide
 - [`specs/realtime-stream-spec.md`](specs/realtime-stream-spec.md) — Phase 2 WebSocket protocol
+- [`specs/continuous-mistake-tone-spec.md`](specs/continuous-mistake-tone-spec.md) — Continuous fail tone (long-silence `ayah.result`)
 - [`specs/first-spec.md`](specs/first-spec.md) — source notes
 - [`docs/agent-context.md`](docs/agent-context.md) — full build-session context for humans and later AI prompts
 - Cursor rules in [`.cursor/rules/`](.cursor/rules/) — auto-applied project guidance
