@@ -820,7 +820,8 @@ def test_validate_rejects_bad_threshold(quran_service: QuranService):
 def ws_client(quran_service: QuranService) -> TestClient:
     ayah1 = quran_service.get_ayah(1, 1)["text"]
     ayah2 = quran_service.get_ayah(1, 2)["text"]
-    recognizer = MockSpeechRecognizer(transcripts=[ayah1, ayah2])
+    # Extra ayah1 copies: audio may arm a completion probe STT before force_assess.
+    recognizer = MockSpeechRecognizer(transcripts=[ayah1, ayah1, ayah1, ayah2])
     app = FastAPI()
     app.include_router(create_stream_router(quran_service, recognizer=recognizer))
     return TestClient(app)
@@ -1245,7 +1246,9 @@ def test_s2_screenshot_heard_does_not_invent_or_advance(quran_service: QuranServ
     transcript = next(e for e in events if e["type"] == "partial.transcript")
     assert "بسم" not in transcript["recognized"].split()
     alignment = next(e for e in events if e["type"] == "partial.alignment")
-    assert alignment["progress"] == pytest.approx(0.75)
+    # Contiguous credit: skipping بسم keeps cumulative progress at 0.
+    assert alignment["progress"] == pytest.approx(0.0)
+    assert alignment.get("window_coverage", 0.0) == pytest.approx(0.75)
     assert not any(e.get("type") == "_assess_trigger" for e in events)
     session.buffer.append_pcm_s16le(_pcm_tone(200, amp=0.2))
     silence_events = session.run_assess(reason="silence")
@@ -1253,7 +1256,6 @@ def test_s2_screenshot_heard_does_not_invent_or_advance(quran_service: QuranServ
     result = next(e for e in silence_events if e["type"] == "ayah.result")
     assert result["passed"] is False
     assert "بسم" not in result["recognized"].split()
-    assert "بسم" in result["missing_words"]
     assert session.current_ayah == 1
     assert session.buffer.duration_ms == pytest.approx(0, abs=1)
 
@@ -1460,3 +1462,253 @@ def test_incomplete_1_3_pause_emits_fail_result_not_stall(
     assert any(e["type"] == "session.waiting" for e in events)
     assert session.current_ayah == 3
     assert session.buffer.duration_ms == pytest.approx(0, abs=1)
+
+
+# --- Multi-utterance credit (specs/multi-utterance-credit-spec.md) --------
+
+
+def test_s1_two_utterances_prefix_then_suffix_pass_advance(
+    quran_service: QuranService,
+):
+    """S1: prefix then suffix → one passed ayah.result + session.advance."""
+    ayah = quran_service.get_ayah(1, 1)["text"]
+    from app.services.normalizer import tokenize
+
+    tokens = tokenize(ayah)
+    prefix = " ".join(tokens[:2])
+    suffix = " ".join(tokens[2:])
+    recognizer = MockSpeechRecognizer(transcript=prefix)
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        end_surah=1,
+        end_ayah=3,
+        threshold=0.85,
+        fail_policy="retry",
+        auto_advance=True,
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    first = session.run_assess(reason="silence")
+    assert not any(e["type"] == "ayah.result" for e in first)
+    assert session._credit_cursor() == 2
+    assert any(e["type"] == "session.listening" for e in first)
+
+    recognizer.transcript = suffix
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    second = session.run_assess(reason="silence")
+    result = next(e for e in second if e["type"] == "ayah.result")
+    assert result["passed"] is True
+    assert result["credit_complete"] is True
+    assert result["credit_utterances"] == 2
+    assert result["coverage"] == pytest.approx(1.0)
+    assert any(e["type"] == "session.advance" for e in second)
+    assert session.current_ayah == 2
+
+
+def test_s2_multi_utterance_auto_advance_next_ayah(quran_service: QuranService):
+    """S2: after credit-complete pass, next ayah payload is correct."""
+    ayah = quran_service.get_ayah(1, 1)["text"]
+    from app.services.normalizer import tokenize
+
+    tokens = tokenize(ayah)
+    recognizer = MockSpeechRecognizer(transcript=" ".join(tokens[:2]))
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        end_surah=1,
+        end_ayah=3,
+        threshold=0.85,
+        fail_policy="retry",
+        auto_advance=True,
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    session.run_assess(reason="silence")
+    recognizer.transcript = " ".join(tokens[2:])
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="silence")
+    advance = next(e for e in events if e["type"] == "session.advance")
+    assert advance["to"]["surah"] == 1
+    assert advance["to"]["ayah"] == 2
+    assert advance["from"]["ayah"] == 1
+
+
+def test_s3_prefix_long_silence_empty_retains_credit(quran_service: QuranService):
+    """S3: prefix credited, then empty long silence → no fail; credit kept."""
+    ayah = quran_service.get_ayah(1, 1)["text"]
+    from app.services.normalizer import tokenize
+
+    tokens = tokenize(ayah)
+    recognizer = MockSpeechRecognizer(transcript=" ".join(tokens[:2]))
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        threshold=0.85,
+        fail_policy="retry",
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    session.run_assess(reason="silence")
+    assert session._credit_cursor() == 2
+
+    recognizer.transcript = ""
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="silence")
+    assert not any(e["type"] == "ayah.result" for e in events)
+    assert session._credit_cursor() == 2
+    listening = next(e for e in events if e["type"] == "session.listening")
+    assert listening["cleared"] is True
+    assert listening["credit_cursor"] == 2
+
+
+def test_s4_wrong_continuation_fails_keeps_credit_by_default(
+    quran_service: QuranService,
+):
+    """S4: wrong Heard at cursor → fail + tone path; credit kept (default)."""
+    ayah = quran_service.get_ayah(1, 1)["text"]
+    from app.services.normalizer import tokenize
+
+    tokens = tokenize(ayah)
+    recognizer = MockSpeechRecognizer(transcript=" ".join(tokens[:2]))
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        threshold=0.85,
+        fail_policy="retry",
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    session.run_assess(reason="silence")
+    assert session._credit_cursor() == 2
+
+    recognizer.transcript = "باطل خطأ"
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="silence")
+    result = next(e for e in events if e["type"] == "ayah.result")
+    assert result["passed"] is False
+    assert result["credit_cursor"] == 2
+    assert session._credit_cursor() == 2
+    assert any(e["type"] == "session.waiting" for e in events)
+
+
+def test_s5_single_utterance_still_pass_advances(quran_service: QuranService):
+    """S5: full ayah in one window still pass-advances."""
+    ayah = quran_service.get_ayah(1, 1)["text"]
+    recognizer = MockSpeechRecognizer(transcript=ayah)
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        end_surah=1,
+        end_ayah=2,
+        threshold=0.85,
+        fail_policy="retry",
+        auto_advance=True,
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="silence")
+    result = next(e for e in events if e["type"] == "ayah.result")
+    assert result["passed"] is True
+    assert result.get("credit_complete") is True
+    assert result.get("credit_utterances") == 1
+    assert any(e["type"] == "session.advance" for e in events)
+
+
+def test_s6_cumulative_complete_despite_low_window_coverage(
+    quran_service: QuranService,
+):
+    """S6: suffix window alone is low coverage; cumulative complete → pass."""
+    ayah = quran_service.get_ayah(1, 1)["text"]
+    from app.services.normalizer import tokenize
+    from app.services.assessor import MemorizationAssessor
+
+    tokens = tokenize(ayah)
+    suffix = " ".join(tokens[2:])
+    window = MemorizationAssessor().progress(ayah, suffix)
+    assert window < settings.STREAM_COVERAGE_THRESHOLD
+
+    recognizer = MockSpeechRecognizer(transcript=" ".join(tokens[:2]))
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        end_surah=1,
+        end_ayah=2,
+        threshold=0.85,
+        fail_policy="retry",
+        auto_advance=True,
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    session.run_assess(reason="silence")
+    recognizer.transcript = suffix
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="silence")
+    result = next(e for e in events if e["type"] == "ayah.result")
+    assert result["passed"] is True
+    assert result["window_coverage"] < settings.STREAM_COVERAGE_THRESHOLD
+    assert result["coverage"] == pytest.approx(1.0)
+
+
+def test_s7_advance_resets_credit(quran_service: QuranService):
+    """S7: after advance, new ayah credit cursor is 0."""
+    ayah = quran_service.get_ayah(1, 1)["text"]
+    recognizer = MockSpeechRecognizer(transcript=ayah)
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        end_surah=1,
+        end_ayah=3,
+        threshold=0.85,
+        fail_policy="retry",
+        auto_advance=True,
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    session.run_assess(reason="silence")
+    assert session.current_ayah == 2
+    assert session._credit_cursor() == 0
+    assert session._credit_utterances == 0
+
+
+def test_s8_credit_disabled_legacy_window_only(
+    quran_service: QuranService, monkeypatch
+):
+    """S8: STREAM_MULTI_UTTERANCE_CREDIT=false → suffix alone does not pass."""
+    monkeypatch.setattr(settings, "STREAM_MULTI_UTTERANCE_CREDIT", False)
+    ayah = quran_service.get_ayah(1, 1)["text"]
+    from app.services.normalizer import tokenize
+
+    tokens = tokenize(ayah)
+    recognizer = MockSpeechRecognizer(transcript=" ".join(tokens[:2]))
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        end_surah=1,
+        end_ayah=2,
+        threshold=0.85,
+        fail_policy="retry",
+        auto_advance=True,
+        partials=False,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    assert session._credit_mask == []
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    first = session.run_assess(reason="silence")
+    # Legacy: incomplete non-empty → fail result (not credit retain).
+    assert any(e["type"] == "ayah.result" and e["passed"] is False for e in first)

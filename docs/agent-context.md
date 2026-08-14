@@ -6,7 +6,7 @@
 - Phase 1 REST: `specs/implementation-spec.md`
 - Phase 2 stream: `specs/realtime-stream-spec.md`
 
-**Last updated:** 2026-08-14 (Continuous cross-surah open default)
+**Last updated:** 2026-08-15 (multi-utterance credit in Continuous)
 
 ---
 
@@ -37,9 +37,10 @@ Local-first Quran memorization assessor:
     - `STREAM_VAD_RMS_THRESHOLD` (0.015) — speech vs silence for utterance boundaries.
     - `STREAM_STT_RMS_THRESHOLD` (0.008) — whether periodic / auto STT is worth calling (quieter; AGC-off + denoise often sits under the VAD floor).
     - **`ayah.force_assess` (Check now) always runs STT** when the buffer has ≥ `STREAM_MIN_UTTERANCE_MS` of audio — it does **not** use the energy short-circuit. Empty Heard → soft `error.code=no_speech` + `session.listening`, **not** `ayah.result` Score 0%.
-11. **Incomplete long silence:** non-empty Heard below coverage **scores** (`ayah.result` fail + `fail_policy`) so the client can play the warning tone once. Character score ≥ 85% does **not** pass-advance until coverage also clears 0.85 (avoids Basmala-without-`بسم` false advance). Empty Heard still abandons (clear UI, no fail / no tone). Short silence with low coverage keeps the buffer and emits `session.listening`.
+11. **Incomplete long silence:** non-empty Heard that is a **failed attempt** (mismatch / cannot cleanly extend contiguous credit) **scores** (`ayah.result` fail + `fail_policy`) so the client can play the warning tone once. A **successful partial chunk** (prefix credit advanced, ayah not complete) does **not** fail — credit is retained, buffer cleared, `session.listening`. Character score ≥ 85% does **not** pass-advance until contiguous credit covers the ayah (or legacy window coverage when `STREAM_MULTI_UTTERANCE_CREDIT=false`). Empty Heard still abandons (keep credit chips; no fail / no tone). Short silence with low coverage keeps the buffer, commits credit, and emits `session.listening`.
 12. **Mistake warning tone:** Continuous / Single play the Phase 1 660 Hz cue **once** per `(surah, ayah, attempt)` on fail (`ayah.result` or REST assess). The client **primes a dedicated playback `AudioContext` on Start Recitation / Start Recording** (user gesture), then falls back to the live capture context if needed — capture-only oscillators were often inaudible. See `specs/continuous-mistake-tone-spec.md`.
 13. **Cross-surah Continuous default:** `cross_surah: true` and End ayah **Until I stop** (open / no `end_*`). Passing the last ayah of a surah advances to the next surah ayah 1 and keeps the mic on. A closed End ayah still ends with `range_complete`. See `specs/cross-surah-advance-spec.md`.
+14. **Multi-utterance word credit:** Continuous keeps a contiguous **credit cursor** on the current ayah across silence boundaries. Each STT window merges via full / suffix / resume-at-cursor alignment (`merge_credit` in `assessor.py`). When the cursor reaches N → `ayah.result` `passed=true` + `credit_complete` + auto-advance (even if the last window is only a suffix). Live `partial.alignment.progress` is **cumulative**; `window_coverage` is optional debug. REST Single unchanged. Spec: `specs/multi-utterance-credit-spec.md`. Implementation notes: `docs/multi-utterance-credit.md`.
 
 **Still out of scope:** tajweed, accounts/progress DB, Quran-fine-tuned ASR, leftover-carry for pause-less tilawah (v1.1), multi-replica sticky sessions.
 

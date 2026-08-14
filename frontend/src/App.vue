@@ -317,7 +317,17 @@ function handleStreamMessage(msg) {
       break;
     case "session.listening":
       if (msg.cleared) {
-        clearLiveHighlights();
+        liveRecognized.value = "";
+        const keepCredit =
+          typeof msg.credit_cursor === "number" && msg.credit_cursor > 0;
+        if (keepCredit) {
+          if (typeof msg.progress === "number") {
+            liveProgress.value = msg.progress;
+          }
+          liveFromPartial.value = true;
+        } else {
+          clearLiveHighlights();
+        }
       }
       status.value =
         msg.hint ||

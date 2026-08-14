@@ -188,15 +188,17 @@ P0 closes **T1** and **T4** without inventing a second scoring system.
 
 1. There is enough PCM for a final STT (existing min-utterance / energy rules), and  
 2. Heard text is non-empty after confidence/recovery filters, and  
-3. `coverage < STREAM_COVERAGE_THRESHOLD` **or** `assess().passed === false`,
+3. The window is a **failed attempt** — committed mismatch at the credit cursor / cannot cleanly extend contiguous credit (see [`multi-utterance-credit-spec.md`](multi-utterance-credit-spec.md) §7.5) — **or** (legacy / credit disabled) `coverage < STREAM_COVERAGE_THRESHOLD` **or** `assess().passed === false`,
 
 → run the normal assess path and emit `ayah.result` with `passed` / `warning` / alignment / wrong words, then apply `fail_policy` (retry → `session.waiting`, etc.).
+
+**Narrowing (2026-08-15):** Long silence with a **successful partial chunk** (contiguous credit advanced, ayah not complete, no trailing wrong token) is **incomplete continuation** — **no** fail `ayah.result`, **no** mistake tone; keep credit and re-arm listening. Do not treat every below-coverage Heard as a fail.
 
 **Keep short silence (`silence_short`) unchanged:** still do **not** finalize below coverage (breath between words must not fail the ayah).
 
 **Keep empty Heard as non-error:** quiet mic / filtered-empty continues to use `_no_speech_events` / abandon-without-fail (no tone). That preserves the quiet-mic regression fix.
 
-**Pass still requires coverage:** `MemorizationAssessor` character score is unchanged, but a long-silence result with `coverage < STREAM_COVERAGE_THRESHOLD` is emitted as `passed=false` / `warning=true` even if `fuzz.ratio` ≥ threshold (e.g. Basmala missing `بسم` at score 0.90). That keeps the coverage completion gate and still gives the client a fail frame to beep on.
+**Pass still requires full contiguous credit** (or legacy window coverage when multi-utterance credit is off): `MemorizationAssessor` character score is unchanged, but a long-silence result with incomplete credit is emitted as `passed=false` / `warning=true` even if `fuzz.ratio` ≥ threshold (e.g. Basmala missing `بسم` at score 0.90). That keeps the completion gate and still gives the client a fail frame to beep on.
 
 ```text
 reason == silence

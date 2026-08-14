@@ -568,8 +568,9 @@ STREAM_MAX_SESSION_S=1800
 
 - **VAD RMS** segments speech vs silence.
 - **STT RMS** (lower) decides whether automatic periodic STT is worth calling. Check now ignores this gate (see `ayah.force_assess` above).
-- **Stable ticks** require consecutive high-coverage probes before auto-finalize (avoids mid-word `ayah.result` on short ayahs).
-- **Long silence below coverage:** if Heard is **non-empty**, emit `ayah.result` (typically fail) and apply `fail_policy` so the client can play the mistake tone. Empty Heard still abandons without scoring. **Short silence** below coverage never finalizes (breath between words). See [`continuous-mistake-tone-spec.md`](continuous-mistake-tone-spec.md).
+- **Stable ticks** require consecutive high-coverage probes before auto-finalize (avoids mid-word `ayah.result` on short ayahs). Coverage for the probe is **cumulative credit** when multi-utterance credit is on (see [`multi-utterance-credit-spec.md`](multi-utterance-credit-spec.md)).
+- **Long silence below completion:** if Heard is a **failed attempt** (mismatch at credit cursor), emit `ayah.result` (typically fail) and apply `fail_policy` so the client can play the mistake tone. A **successful partial chunk** keeps credit and stays listening (no tone). Empty Heard still abandons without scoring. **Short silence** below completion never finalizes (breath between words). See [`continuous-mistake-tone-spec.md`](continuous-mistake-tone-spec.md).
+- **Multi-utterance credit:** user may split an ayah across pauses; contiguous prefix credit must reach N before pass-advance. REST `/assess` unchanged.
 
 ---
 

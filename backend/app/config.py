@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     # Coverage probe must see ≥ this many consecutive high-coverage ticks
     # before auto-finalize (mid-utterance STT on short ayahs is unstable).
     STREAM_COVERAGE_STABLE_TICKS: int = 2
+    # Multi-utterance word credit (Continuous): contiguous prefix across pauses.
+    STREAM_MULTI_UTTERANCE_CREDIT: bool = True
+    STREAM_CREDIT_KEEP_ON_FAIL: bool = True
+    STREAM_CREDIT_CLEAR_ON_FAIL: bool = False
+    STREAM_CREDIT_REQUIRE_CONTIGUOUS: bool = True
     STREAM_OVERLAP_MS: int = 300
     STREAM_IDLE_TIMEOUT_S: int = 60
     STREAM_MAX_SESSION_S: int = 1800

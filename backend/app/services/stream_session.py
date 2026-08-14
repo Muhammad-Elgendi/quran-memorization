@@ -13,7 +13,14 @@ from typing import Any
 import numpy as np
 
 from ..config import settings
-from .assessor import MemorizationAssessor
+from .assessor import (
+    MemorizationAssessor,
+    alignment_from_credit,
+    credit_complete_assessment,
+    credit_cursor_from_mask,
+    empty_credit_mask,
+    merge_credit,
+)
 from .quran_service import QuranService
 from .speech_service import SpeechRecognizer
 from .stream_audio import EnergyVadSegmenter, PcmRingBuffer, pcm_has_speech
@@ -122,6 +129,11 @@ class StreamSession:
         self.vad = EnergyVadSegmenter(sample_rate=config.sample_rate)
         self._stats: dict[tuple[int, int], AyahAttemptStats] = {}
         self._ensure_stats(self.current_surah, self.current_ayah)
+
+        # Contiguous-prefix word credit for the current ayah (multi-utterance).
+        self._credit_mask: list[bool] = []
+        self._credit_utterances = 0
+        self._reset_credit_for_current_ayah()
 
     # --- helpers ---------------------------------------------------------
 
@@ -268,8 +280,40 @@ class StreamSession:
     def has_stt_work(self) -> bool:
         return self._pending_assess is not None or self.should_run_periodic_stt()
 
+    def _credit_enabled(self) -> bool:
+        return bool(settings.STREAM_MULTI_UTTERANCE_CREDIT)
+
+    def _reset_credit_for_current_ayah(self) -> None:
+        ayah = self.quran.get_ayah(self.current_surah, self.current_ayah)
+        text = ayah["text"] if ayah else ""
+        self._credit_mask = empty_credit_mask(text) if self._credit_enabled() else []
+        self._credit_utterances = 0
+
+    def _credit_cursor(self) -> int:
+        if not self._credit_mask:
+            return 0
+        return credit_cursor_from_mask(self._credit_mask)
+
+    def _credit_fields(self) -> dict[str, Any]:
+        if not self._credit_enabled() or not self._credit_mask:
+            return {}
+        cursor = self._credit_cursor()
+        total = len(self._credit_mask)
+        return {
+            "credit_cursor": cursor,
+            "credit_total": total,
+            "credit_complete": cursor == total and total > 0,
+        }
+
+    def _apply_credit_policy_on_fail(self) -> None:
+        clear = settings.STREAM_CREDIT_CLEAR_ON_FAIL or (
+            not settings.STREAM_CREDIT_KEEP_ON_FAIL
+        )
+        if clear:
+            self._reset_credit_for_current_ayah()
+
     def _listening_event(self, *, cleared: bool, hint: str | None = None) -> dict[str, Any]:
-        return self.base_event(
+        payload = self.base_event(
             "session.listening",
             surah=self.current_surah,
             ayah=self.current_ayah,
@@ -277,6 +321,12 @@ class StreamSession:
             cleared=cleared,
             hint=hint or INCOMPLETE_LISTEN_HINT,
         )
+        payload.update(self._credit_fields())
+        cursor = self._credit_cursor()
+        total = len(self._credit_mask) if self._credit_mask else 0
+        if total:
+            payload["progress"] = round(cursor / total, 3)
+        return payload
 
     def _pcm_has_stt_energy(self, samples) -> bool:
         return pcm_has_speech(
@@ -308,6 +358,25 @@ class StreamSession:
         self.vad.reset()
         self.stt_busy = False
         self.state = SessionState.LISTENING
+        cursor = self._credit_cursor()
+        total = len(self._credit_mask) if self._credit_mask else 0
+        progress = round(cursor / total, 3) if total else 0.0
+        expected = self.quran.get_ayah(self.current_surah, self.current_ayah)
+        expected_text = expected["text"] if expected else ""
+        alignment: list[dict[str, Any]] = []
+        if self._credit_enabled() and expected_text and self._credit_mask:
+            alignment = alignment_from_credit(expected_text, self._credit_mask)
+        align_event = self.base_event(
+            "partial.alignment",
+            surah=self.current_surah,
+            ayah=self.current_ayah,
+            alignment=alignment,
+            progress=progress,
+            provisional=True,
+        )
+        align_event.update(self._credit_fields())
+        if total:
+            align_event["window_coverage"] = 0.0
         return [
             self.base_event(
                 "partial.transcript",
@@ -316,16 +385,72 @@ class StreamSession:
                 recognized="",
                 stable=False,
             ),
-            self.base_event(
-                "partial.alignment",
-                surah=self.current_surah,
-                ayah=self.current_ayah,
-                alignment=[],
-                progress=0.0,
-                provisional=True,
-            ),
+            align_event,
             self._listening_event(cleared=True),
         ]
+
+    def _incomplete_continuation_events(
+        self,
+        *,
+        recognized: str,
+        stt_ms: int,
+        transcription: Transcription | None,
+        clear_buffer: bool,
+    ) -> list[dict[str, Any]]:
+        """Prefix credit advanced (or retained) but ayah not complete — no fail tone."""
+        if clear_buffer:
+            self.buffer.clear(keep_overlap_ms=settings.STREAM_OVERLAP_MS)
+            self._last_stt = None
+            self.vad.reset()
+        self._coverage_streak = 0
+        self.stt_busy = False
+        self.state = SessionState.LISTENING
+        events: list[dict[str, Any]] = []
+        if self.config.partials and (recognized or self._credit_cursor() > 0):
+            events.extend(
+                self._partial_events_from_recognized(
+                    recognized or "",
+                    stt_ms=stt_ms,
+                    transcription=transcription,
+                    commit_credit=False,
+                )
+            )
+        events.append(self._listening_event(cleared=clear_buffer))
+        return events
+
+    def _commit_credit_merge(
+        self,
+        expected_text: str,
+        recognized: str,
+    ):
+        """Merge utterance into session credit; bump utterance count when extended."""
+        if not self._credit_enabled() or not expected_text:
+            return None
+        before = self._credit_cursor()
+        merge = merge_credit(
+            expected_text,
+            recognized or "",
+            self._credit_mask,
+            word_match_threshold=settings.WORD_MATCH_THRESHOLD,
+        )
+        self._credit_mask = merge.credit_mask
+        if (recognized or "").strip() and merge.extended:
+            self._credit_utterances += 1
+        elif merge.complete and self._credit_utterances == 0 and before == 0:
+            # Edge: empty expected already complete — leave at 0.
+            pass
+        return merge
+
+    def _tentative_credit_merge(self, expected_text: str, recognized: str):
+        """Non-committing merge for live partial UX."""
+        if not self._credit_enabled() or not expected_text:
+            return None
+        return merge_credit(
+            expected_text,
+            recognized or "",
+            self._credit_mask,
+            word_match_threshold=settings.WORD_MATCH_THRESHOLD,
+        )
 
     # --- validation ------------------------------------------------------
 
@@ -613,64 +738,105 @@ class StreamSession:
         *,
         stt_ms: int,
         transcription: Transcription | None = None,
+        commit_credit: bool = False,
     ) -> list[dict[str, Any]]:
         expected = self.quran.get_ayah(self.current_surah, self.current_ayah)
         expected_text = expected["text"] if expected else ""
         display = self._partial_display_text(recognized, expected_text)
-        if not display:
+        if not display and not (
+            self._credit_enabled() and self._credit_cursor() > 0
+        ):
             return []
 
-        transcript_event = self.base_event(
-            "partial.transcript",
-            surah=self.current_surah,
-            ayah=self.current_ayah,
-            recognized=display,
-            stable=False,
-            stt_ms=stt_ms,
-        )
-        if (
-            transcription is not None
-            and transcription.scored
-            and settings.STT_CONFIDENCE_FILTER
-        ):
-            transcript_event["sequence_confidence"] = round(
-                transcription.sequence_confidence, 4
+        events: list[dict[str, Any]] = []
+        if display:
+            transcript_event = self.base_event(
+                "partial.transcript",
+                surah=self.current_surah,
+                ayah=self.current_ayah,
+                recognized=display,
+                stable=False,
+                stt_ms=stt_ms,
             )
-            display_words = display.split()
-            di = 0
-            words_out: list[dict[str, Any]] = []
-            for word in transcription.words:
-                payload = {
-                    "text": word.text,
-                    "confidence": round(word.confidence, 4),
-                    "kept": word.kept,
-                }
-                if word.kept:
-                    if di < len(display_words) and word.text == display_words[di]:
-                        di += 1
-                    else:
-                        payload["kept"] = False
-                words_out.append(payload)
-            transcript_event["words"] = words_out
-        if transcription is not None:
-            transcript_event.update(recovery_debug_fields(transcription))
+            if (
+                transcription is not None
+                and transcription.scored
+                and settings.STT_CONFIDENCE_FILTER
+            ):
+                transcript_event["sequence_confidence"] = round(
+                    transcription.sequence_confidence, 4
+                )
+                display_words = display.split()
+                di = 0
+                words_out: list[dict[str, Any]] = []
+                for word in transcription.words:
+                    payload = {
+                        "text": word.text,
+                        "confidence": round(word.confidence, 4),
+                        "kept": word.kept,
+                    }
+                    if word.kept:
+                        if di < len(display_words) and word.text == display_words[di]:
+                            di += 1
+                        else:
+                            payload["kept"] = False
+                    words_out.append(payload)
+                transcript_event["words"] = words_out
+            if transcription is not None:
+                transcript_event.update(recovery_debug_fields(transcription))
+            events.append(transcript_event)
 
-        events: list[dict[str, Any]] = [transcript_event]
         if expected_text:
             assessor = MemorizationAssessor(threshold=self.config.threshold)
-            progress = assessor.progress(expected_text, display)
-            result = assessor.assess(expected_text, display)
-            provisional = progress < settings.STREAM_COVERAGE_THRESHOLD
-            events.append(
-                self.base_event(
+            window_coverage = (
+                assessor.progress(expected_text, display) if display else 0.0
+            )
+            merge = None
+            if self._credit_enabled():
+                if commit_credit and display:
+                    merge = self._commit_credit_merge(expected_text, display)
+                else:
+                    merge = self._tentative_credit_merge(
+                        expected_text, display or ""
+                    )
+                progress = (
+                    merge.cumulative_coverage
+                    if merge is not None
+                    else window_coverage
+                )
+                mask = (
+                    merge.credit_mask
+                    if merge is not None
+                    else self._credit_mask
+                )
+                alignment = alignment_from_credit(expected_text, mask)
+                provisional = progress < settings.STREAM_COVERAGE_THRESHOLD
+                align_event = self.base_event(
+                    "partial.alignment",
+                    surah=self.current_surah,
+                    ayah=self.current_ayah,
+                    alignment=alignment[:40],
+                    progress=round(progress, 3),
+                    provisional=provisional,
+                    window_coverage=round(window_coverage, 3),
+                )
+                if merge is not None:
+                    align_event["credit_cursor"] = merge.credit_cursor
+                    align_event["credit_total"] = merge.credit_total
+                else:
+                    align_event.update(self._credit_fields())
+            else:
+                result = assessor.assess(expected_text, display or "")
+                provisional = window_coverage < settings.STREAM_COVERAGE_THRESHOLD
+                align_event = self.base_event(
                     "partial.alignment",
                     surah=self.current_surah,
                     ayah=self.current_ayah,
                     alignment=result.alignment[:40],
-                    progress=round(progress, 3),
+                    progress=round(window_coverage, 3),
                     provisional=provisional,
                 )
-            )
+            events.append(align_event)
         return events
 
     def run_periodic_stt(self) -> list[dict[str, Any]]:
@@ -740,8 +906,19 @@ class StreamSession:
             expected = self.quran.get_ayah(self.current_surah, self.current_ayah)
             coverage = 0.0
             if expected and recognized:
-                assessor = MemorizationAssessor(threshold=self.config.threshold)
-                coverage = assessor.progress(expected["text"], recognized)
+                expected_text = expected["text"]
+                if self._credit_enabled():
+                    merge = self._tentative_credit_merge(
+                        expected_text, recognized
+                    )
+                    coverage = (
+                        merge.cumulative_coverage if merge is not None else 0.0
+                    )
+                    if merge is not None and merge.complete:
+                        coverage = 1.0
+                else:
+                    assessor = MemorizationAssessor(threshold=self.config.threshold)
+                    coverage = assessor.progress(expected_text, recognized)
             if expected and recognized and coverage >= settings.STREAM_COVERAGE_THRESHOLD:
                 self._coverage_streak += 1
                 needed = max(1, int(settings.STREAM_COVERAGE_STABLE_TICKS))
@@ -871,59 +1048,119 @@ class StreamSession:
         expected_text = expected_ayah["text"] if expected_ayah else ""
         assessor = MemorizationAssessor(threshold=self.config.threshold)
 
-        coverage = (
+        window_coverage = (
             assessor.progress(expected_text, recognized or "")
             if expected_text
             else 0.0
         )
+        credit_merge = None
+        if self._credit_enabled() and expected_text:
+            credit_merge = self._commit_credit_merge(
+                expected_text, recognized or ""
+            )
+            coverage = (
+                credit_merge.cumulative_coverage
+                if credit_merge is not None
+                else window_coverage
+            )
+            if credit_merge is not None and credit_merge.complete:
+                coverage = 1.0
+        else:
+            coverage = window_coverage
 
         heard = (recognized or "").strip()
 
-        # Short pause after a complete ayah → score right away (~400 ms).
-        # Keep the buffer: a breath between words is not a restart.
-        # Do not re-arm VAD short-silence here — continued pause must reach
-        # long silence so incomplete ayahs are not stuck at a 50% partial.
+        # Short pause: commit credit (above), keep buffer if incomplete.
         if reason == "silence_short" and expected_text:
             if coverage < settings.STREAM_COVERAGE_THRESHOLD:
-                self.stt_busy = False
-                self.state = SessionState.LISTENING
-                events = []
-                if self.config.partials and heard:
-                    events.extend(
-                        self._partial_events_from_recognized(
-                            recognized or "",
-                            stt_ms=stt_ms,
-                            transcription=transcription,
-                        )
-                    )
-                events.append(self._listening_event(cleared=False))
-                return events
+                return self._incomplete_continuation_events(
+                    recognized=recognized or "",
+                    stt_ms=stt_ms,
+                    transcription=transcription,
+                    clear_buffer=False,
+                )
 
         # Empty Heard is "no speech / filtered", not a memorization error.
-        # Quiet mic / filtered-empty must not paint Score 0%.
         if not heard:
             if reason == "force":
                 return self._no_speech_events(cleared=False)
             if reason == "silence":
                 return self._abandon_incomplete_attempt()
 
-        # Long silence + non-empty Heard below coverage: user stopped on a
-        # wrong / incomplete take. Score it (ayah.result fail) so the client
-        # can play the warning tone. Fail+retry still clears the buffer.
-
-        self.attempt += 1
-        result = assessor.assess(expected_text, recognized or "")
-        # Coverage is the stream completion gate. A high character score on an
-        # unfinished ayah (e.g. Basmala missing بسم) must not pass-advance.
-        passed = result.passed
-        warning = result.warning
+        # Long silence + successful partial chunk: keep credit, no fail/tone.
         if (
             reason == "silence"
             and expected_text
-            and coverage < settings.STREAM_COVERAGE_THRESHOLD
+            and self._credit_enabled()
+            and credit_merge is not None
+            and not credit_merge.complete
+            and not credit_merge.has_mismatch_at_cursor
         ):
-            passed = False
-            warning = True
+            return self._incomplete_continuation_events(
+                recognized=recognized or "",
+                stt_ms=stt_ms,
+                transcription=transcription,
+                clear_buffer=True,
+            )
+
+        # Coverage probe fired on high cumulative but ayah not fully credited yet.
+        if (
+            reason == "coverage"
+            and expected_text
+            and self._credit_enabled()
+            and credit_merge is not None
+            and not credit_merge.complete
+        ):
+            return self._incomplete_continuation_events(
+                recognized=recognized or "",
+                stt_ms=stt_ms,
+                transcription=transcription,
+                clear_buffer=False,
+            )
+
+        # Credit-complete (possibly across utterances) → synthetic pass.
+        credit_complete = bool(
+            self._credit_enabled()
+            and credit_merge is not None
+            and credit_merge.complete
+        )
+
+        self.attempt += 1
+        if credit_complete:
+            result = credit_complete_assessment(
+                expected_text,
+                threshold=self.config.threshold,
+                credit_utterances=max(1, self._credit_utterances),
+            )
+            # Heard line still shows this turn's window.
+            result.recognized = recognized or result.recognized
+            passed = True
+            warning = False
+            coverage = 1.0
+        else:
+            result = assessor.assess(expected_text, recognized or "")
+            # Coverage is the stream completion gate on silence. A high character
+            # score on an unfinished ayah must not pass-advance. Force assess
+            # still uses character score unless multi-utterance credit is short.
+            passed = result.passed
+            warning = result.warning
+            if (
+                reason == "silence"
+                and expected_text
+                and coverage < settings.STREAM_COVERAGE_THRESHOLD
+            ):
+                passed = False
+                warning = True
+            if (
+                self._credit_enabled()
+                and credit_merge is not None
+                and not credit_merge.complete
+                and reason in ("force", "silence", "coverage", "silence_short")
+            ):
+                # Contiguous credit owns Continuous completion — do not pass on
+                # a partial credit set even if character fuzz clears threshold.
+                passed = False
+                warning = True
 
         stats = self._ensure_stats(self.current_surah, self.current_ayah)
         stats.attempts += 1
@@ -957,7 +1194,15 @@ class StreamSession:
             stt_ms=stt_ms,
             trigger=reason,
             coverage=round(coverage, 4),
+            window_coverage=round(window_coverage, 4),
         )
+        if self._credit_enabled():
+            result_event.update(self._credit_fields())
+            result_event["credit_complete"] = credit_complete
+            if credit_complete or self._credit_utterances:
+                result_event["credit_utterances"] = max(
+                    1 if credit_complete else 0, self._credit_utterances
+                )
         if (
             transcription is not None
             and transcription.scored
@@ -978,8 +1223,11 @@ class StreamSession:
         elif self.config.fail_policy == "retry":
             self.buffer.clear(keep_overlap_ms=0.0)
             self._last_stt = None
+            self._apply_credit_policy_on_fail()
         else:
             self.buffer.clear(keep_overlap_ms=settings.STREAM_OVERLAP_MS)
+            if not passed:
+                self._apply_credit_policy_on_fail()
         self.vad.reset()
         self.stt_busy = False
         self._coverage_streak = 0
@@ -1048,6 +1296,7 @@ class StreamSession:
         self._stt_queued = False
         self._pending_assess = None
         self._last_stt = None
+        self._reset_credit_for_current_ayah()
         self._ensure_stats(self.current_surah, self.current_ayah)
         self.state = SessionState.LISTENING
 
