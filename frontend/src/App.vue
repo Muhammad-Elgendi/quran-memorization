@@ -8,7 +8,11 @@ import {
 } from "./stream";
 import { describeDenoiseMode } from "./audio/capture-service";
 import { heardTextFromMessage, wordsFromAlignment } from "./highlight";
-import { createAttemptWarner, playWarningTone } from "./audio/warning-tone";
+import {
+  createAttemptWarner,
+  playWarningTone,
+  primeWarningAudio,
+} from "./audio/warning-tone";
 
 const labTrace =
   typeof window !== "undefined" &&
@@ -77,20 +81,32 @@ function clearLiveHighlights() {
   liveFromPartial.value = false;
 }
 
-async function loadAyahOptions(surahNumber) {
+async function loadAyahOptions(surahNumber, { preserveSelection = false } = {}) {
   if (!surahNumber) {
     ayahOptions.value = [];
-    selectedAyah.value = null;
-    endAyah.value = null;
+    if (!preserveSelection) {
+      selectedAyah.value = null;
+      endAyah.value = null;
+    }
     return;
   }
   const response = await api.get(`/api/quran/surahs/${surahNumber}`);
   ayahOptions.value = (response.data.ayahs || []).map((a) => a.number);
-  selectedAyah.value = ayahOptions.value[0] ?? null;
-  endAyah.value = ayahOptions.value[ayahOptions.value.length - 1] ?? null;
+  if (!preserveSelection) {
+    selectedAyah.value = ayahOptions.value[0] ?? null;
+    // Continuous default: open end (until stop), not last ayah of surah.
+    endAyah.value = null;
+  }
 }
 
 watch(selectedSurah, (value) => {
+  // Do not reset start/end ayah mid-session (cross-surah advance syncs surah).
+  if (sessionActive.value || continuousBusy.value) {
+    loadAyahOptions(value, { preserveSelection: true }).catch(() => {
+      error.value = "Could not load ayahs for the selected surah.";
+    });
+    return;
+  }
   loadAyahOptions(value).catch(() => {
     error.value = "Could not load ayahs for the selected surah.";
   });
@@ -125,6 +141,8 @@ async function startRecording() {
   error.value = "";
 
   try {
+    // Unlock speakers during the click gesture — assess returns later.
+    await primeWarningAudio();
     processedCapture = await startProcessedStream();
     mediaRecorder = new MediaRecorder(processedCapture.stream);
     audioChunks = [];
@@ -284,6 +302,12 @@ function handleStreamMessage(msg) {
       currentAyah.value = msg.to;
       attemptWarner.reset();
       clearLiveHighlights();
+      if (msg.to?.surah != null && msg.to.surah !== selectedSurah.value) {
+        selectedSurah.value = msg.to.surah;
+      }
+      if (msg.to?.ayah != null) {
+        selectedAyah.value = msg.to.ayah;
+      }
       status.value = micActive.value
         ? `Listening — ${msg.to.surah}:${msg.to.ayah}`
         : `Next — ${msg.to.surah}:${msg.to.ayah}. Press Start Recitation.`;
@@ -303,7 +327,16 @@ function handleStreamMessage(msg) {
       break;
     case "session.summary":
       sessionSummary.value = msg;
-      status.value = "Session ended.";
+      status.value =
+        msg.reason === "range_complete"
+          ? "Range complete."
+          : msg.reason === "quran_complete"
+            ? "Quran complete."
+            : msg.reason === "surah_complete"
+              ? "Surah complete."
+              : msg.reason === "session_timeout"
+                ? "Session timed out."
+                : "Session ended.";
       sessionActive.value = false;
       attemptWarner.reset();
       captureAudioContext = null;
@@ -345,15 +378,16 @@ function ensureSession() {
     let settled = false;
 
     ws.onopen = () => {
+      const closedEnd = endAyah.value != null && endAyah.value !== "";
       const startPayload = {
         type: "session.start",
         start_surah: selectedSurah.value,
         start_ayah: selectedAyah.value,
-        end_surah: endAyah.value ? selectedSurah.value : null,
-        end_ayah: endAyah.value || null,
+        end_surah: closedEnd ? selectedSurah.value : null,
+        end_ayah: closedEnd ? endAyah.value : null,
         threshold: threshold.value,
         fail_policy: failPolicy.value,
-        cross_surah: false,
+        cross_surah: true,
         partials: true,
         auto_advance: true,
         audio: {
@@ -429,6 +463,9 @@ async function startMic() {
   }
 
   try {
+    // Unlock the dedicated warning-tone context on this click (capture graph
+    // alone is often inaudible for oscillators while the mic is live).
+    await primeWarningAudio();
     pcmCapture = await startPcmCapture({
       chunkMs: 250,
       onChunk: (buffer) => {
@@ -583,6 +620,7 @@ onBeforeUnmount(() => {
             v-model="endAyah"
             :disabled="!ayahOptions.length || recording || continuousBusy"
           >
+            <option :value="null">Until I stop</option>
             <option v-for="n in ayahOptions" :key="'e' + n" :value="n">
               {{ n }}
             </option>

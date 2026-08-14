@@ -2,15 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createAttemptWarner,
   playWarningTone,
+  primeWarningAudio,
   resetWarningToneState,
   WARNING_TONE,
 } from "../src/audio/warning-tone.js";
 
 function makeMockContext({ state = "running" } = {}) {
   const oscillator = {
+    type: "sine",
     connect: vi.fn(),
     disconnect: vi.fn(),
-    frequency: { value: 0 },
+    frequency: { value: 0, setValueAtTime: vi.fn() },
     start: vi.fn(),
     stop: vi.fn(),
     onended: null,
@@ -18,7 +20,7 @@ function makeMockContext({ state = "running" } = {}) {
   const gain = {
     connect: vi.fn(),
     disconnect: vi.fn(),
-    gain: { value: 0 },
+    gain: { value: 0, setValueAtTime: vi.fn() },
   };
   const ctx = {
     state,
@@ -43,41 +45,71 @@ describe("playWarningTone", () => {
     resetWarningToneState();
   });
 
-  it("resumes a suspended context before starting the oscillator", async () => {
+  it("resumes a suspended shared context before starting the oscillator", async () => {
     const { ctx, oscillator, gain } = makeMockContext({ state: "suspended" });
-    const Ctor = vi.fn();
+    const Ctor = vi.fn(() => ctx);
     vi.stubGlobal("AudioContext", Ctor);
 
-    await playWarningTone({ audioContext: ctx });
+    await playWarningTone();
 
-    expect(ctx.resume).toHaveBeenCalledTimes(1);
-    expect(Ctor).not.toHaveBeenCalled();
-    expect(oscillator.frequency.value).toBe(WARNING_TONE.frequency);
-    expect(gain.gain.value).toBe(WARNING_TONE.gain);
+    expect(ctx.resume).toHaveBeenCalled();
+    expect(oscillator.frequency.setValueAtTime).toHaveBeenCalledWith(
+      WARNING_TONE.frequency,
+      ctx.currentTime,
+    );
+    expect(gain.gain.setValueAtTime).toHaveBeenCalledWith(
+      WARNING_TONE.gain,
+      ctx.currentTime,
+    );
     expect(oscillator.connect).toHaveBeenCalledWith(gain);
     expect(gain.connect).toHaveBeenCalledWith(ctx.destination);
-    expect(oscillator.start).toHaveBeenCalled();
-    expect(oscillator.stop).toHaveBeenCalledWith(ctx.currentTime + WARNING_TONE.duration);
+    expect(oscillator.start).toHaveBeenCalledWith(ctx.currentTime);
+    expect(oscillator.stop).toHaveBeenCalledWith(
+      ctx.currentTime + WARNING_TONE.duration,
+    );
   });
 
-  it("prefers the provided capture context and does not construct another", async () => {
-    const { ctx, oscillator } = makeMockContext();
-    const Ctor = vi.fn(() => {
-      throw new Error("must not construct a second AudioContext");
+  it("falls back to the capture context when shared stays suspended", async () => {
+    const shared = makeMockContext({ state: "suspended" });
+    shared.ctx.resume = vi.fn(async () => {
+      /* remain suspended (autoplay blocked) */
     });
-    vi.stubGlobal("AudioContext", Ctor);
+    const capture = makeMockContext({ state: "running" });
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(() => shared.ctx),
+    );
 
-    await playWarningTone({ audioContext: ctx });
+    await playWarningTone({ audioContext: capture.ctx });
 
-    expect(Ctor).not.toHaveBeenCalled();
-    expect(oscillator.start).toHaveBeenCalled();
+    expect(capture.oscillator.start).toHaveBeenCalled();
+    expect(shared.oscillator.start).not.toHaveBeenCalled();
+  });
+
+  it("prefers a primed shared context over a live capture context", async () => {
+    const shared = makeMockContext({ state: "running" });
+    const capture = makeMockContext({ state: "running" });
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(() => shared.ctx),
+    );
+
+    await primeWarningAudio();
+    await playWarningTone({ audioContext: capture.ctx });
+
+    expect(shared.oscillator.start).toHaveBeenCalled();
+    expect(capture.oscillator.start).not.toHaveBeenCalled();
   });
 
   it("ignores a second play while the tone is still active", async () => {
     const { ctx, oscillator } = makeMockContext();
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(() => ctx),
+    );
 
-    await playWarningTone({ audioContext: ctx });
-    await playWarningTone({ audioContext: ctx });
+    await playWarningTone();
+    await playWarningTone();
 
     expect(ctx.createOscillator).toHaveBeenCalledTimes(1);
     expect(oscillator.start).toHaveBeenCalledTimes(1);
@@ -85,10 +117,14 @@ describe("playWarningTone", () => {
 
   it("clears the playing guard when the oscillator ends", async () => {
     const { ctx, oscillator } = makeMockContext();
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(() => ctx),
+    );
 
-    await playWarningTone({ audioContext: ctx });
+    await playWarningTone();
     oscillator.onended();
-    await playWarningTone({ audioContext: ctx });
+    await playWarningTone();
 
     expect(ctx.createOscillator).toHaveBeenCalledTimes(2);
   });
@@ -106,6 +142,10 @@ describe("createAttemptWarner", () => {
 
   it("plays once per attempt and no-ops a duplicate fail result", async () => {
     const { ctx } = makeMockContext();
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(() => ctx),
+    );
     const warner = createAttemptWarner();
     const fail = {
       surah: 1,
@@ -115,25 +155,36 @@ describe("createAttemptWarner", () => {
       warning: true,
     };
 
-    expect(warner.maybeWarn(fail, { audioContext: ctx })).toBe(true);
-    expect(warner.maybeWarn(fail, { audioContext: ctx })).toBe(false);
-    expect(ctx.createOscillator).toHaveBeenCalledTimes(1);
+    expect(warner.maybeWarn(fail)).toBe(true);
+    expect(warner.maybeWarn(fail)).toBe(false);
+    await vi.waitFor(() => expect(ctx.createOscillator).toHaveBeenCalledTimes(1));
   });
 
   it("does not warn on a pass", () => {
     const { ctx } = makeMockContext();
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(() => ctx),
+    );
     const warner = createAttemptWarner();
     expect(
-      warner.maybeWarn(
-        { surah: 1, ayah: 2, attempt: 1, passed: true, warning: false },
-        { audioContext: ctx },
-      )
+      warner.maybeWarn({
+        surah: 1,
+        ayah: 2,
+        attempt: 1,
+        passed: true,
+        warning: false,
+      }),
     ).toBe(false);
     expect(ctx.createOscillator).not.toHaveBeenCalled();
   });
 
   it("warns again after reset (new ayah / session)", async () => {
     const { ctx, oscillator } = makeMockContext();
+    vi.stubGlobal(
+      "AudioContext",
+      vi.fn(() => ctx),
+    );
     const warner = createAttemptWarner();
     const fail = {
       surah: 1,
@@ -142,11 +193,12 @@ describe("createAttemptWarner", () => {
       passed: false,
       warning: true,
     };
-    warner.maybeWarn(fail, { audioContext: ctx });
+    warner.maybeWarn(fail);
+    await vi.waitFor(() => expect(oscillator.start).toHaveBeenCalled());
     oscillator.onended();
     ctx.createOscillator.mockClear();
     warner.reset();
-    expect(warner.maybeWarn(fail, { audioContext: ctx })).toBe(true);
-    expect(ctx.createOscillator).toHaveBeenCalledTimes(1);
+    expect(warner.maybeWarn(fail)).toBe(true);
+    await vi.waitFor(() => expect(ctx.createOscillator).toHaveBeenCalledTimes(1));
   });
 });

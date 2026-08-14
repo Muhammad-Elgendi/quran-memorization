@@ -114,9 +114,10 @@ The session ends when any of:
 1. Client sends `session.stop` (user pressed Stop / closed mic intentionally).
 2. Client closes the WebSocket.
 3. Configured `end_surah` / `end_ayah` is completed successfully.
-4. End of surah reached and `cross_surah` is false (default).
+4. End of surah reached and `cross_surah` is false (API default). Continuous UI sends `cross_surah: true` with open end — see `cross-surah-advance-spec.md`.
 5. Server idle timeout (no audio / no control messages).
 6. Fatal error (`error` with `fatal: true`).
+7. Corpus end with `cross_surah: true` (`quran_complete`).
 
 ---
 
@@ -164,7 +165,7 @@ Sent once in `session.start` after connect (or as first message; server rejects 
   "end_ayah": null,
   "threshold": 0.85,
   "fail_policy": "retry",
-  "cross_surah": false,
+  "cross_surah": true,
   "audio": {
     "format": "pcm_s16le",
     "sample_rate": 16000,
@@ -184,7 +185,7 @@ Sent once in `session.start` after connect (or as first message; server rejects 
 | `end_ayah` | int \| null | null | Required if `end_surah` set |
 | `threshold` | float | `settings.DEFAULT_THRESHOLD` | Pass threshold 0.5–1.0 |
 | `fail_policy` | string | `"retry"` | `"retry"` \| `"continue"` \| `"stop"` |
-| `cross_surah` | bool | false | If true, after last ayah of surah N go to 1 of N+1 |
+| `cross_surah` | bool | false (API) / true (Continuous UI) | If true, after last ayah of surah N go to 1 of N+1 |
 | `audio.format` | string | `"pcm_s16le"` | Preferred; also allow `"webm_opus"` (see §7) |
 | `audio.sample_rate` | int | 16000 | Must match Moonshine input |
 | `audio.channels` | int | 1 | Mono only in v1 |

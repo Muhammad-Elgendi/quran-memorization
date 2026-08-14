@@ -665,6 +665,143 @@ def test_session_range_complete(quran_service: QuranService):
     assert any(e["type"] == "session.summary" and e["reason"] == "range_complete" for e in events)
 
 
+def test_cross_surah_open_advances_to_next_surah(quran_service: QuranService):
+    """S1: open range + cross_surah on last ayah of surah 1 → next surah:1."""
+    ayah = quran_service.get_ayah(1, 7)["text"]
+    expected_next = quran_service.next_ayah(1, 7, cross_surah=True)
+    assert expected_next is not None
+    recognizer = MockSpeechRecognizer(transcript=ayah)
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=7,
+        end_surah=None,
+        end_ayah=None,
+        threshold=0.5,
+        fail_policy="retry",
+        cross_surah=True,
+        partials=False,
+        auto_advance=True,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="force")
+    assert not any(e["type"] == "session.summary" for e in events)
+    advance = next(e for e in events if e["type"] == "session.advance")
+    assert advance["from"] == {"surah": 1, "ayah": 7}
+    assert advance["to"]["surah"] == expected_next[0]
+    assert advance["to"]["ayah"] == expected_next[1]
+    assert session.current_surah == expected_next[0]
+    assert session.current_ayah == expected_next[1]
+
+
+def test_cross_surah_closed_end_still_range_complete(quran_service: QuranService):
+    """S2: closed end at last ayah of start surah → range_complete."""
+    ayah = quran_service.get_ayah(1, 7)["text"]
+    recognizer = MockSpeechRecognizer(transcript=ayah)
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=7,
+        end_surah=1,
+        end_ayah=7,
+        threshold=0.5,
+        fail_policy="retry",
+        cross_surah=True,
+        partials=False,
+        auto_advance=True,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="force")
+    assert any(
+        e["type"] == "session.summary" and e["reason"] == "range_complete"
+        for e in events
+    )
+    assert not any(e["type"] == "session.advance" for e in events)
+
+
+def test_cross_surah_false_surah_complete(quran_service: QuranService):
+    """S3: cross_surah=false, no end, last ayah → surah_complete."""
+    ayah = quran_service.get_ayah(1, 7)["text"]
+    recognizer = MockSpeechRecognizer(transcript=ayah)
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=7,
+        threshold=0.5,
+        fail_policy="retry",
+        cross_surah=False,
+        partials=False,
+        auto_advance=True,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="force")
+    assert any(
+        e["type"] == "session.summary" and e["reason"] == "surah_complete"
+        for e in events
+    )
+
+
+def test_cross_surah_multi_surah_closed_range(quran_service: QuranService):
+    """S4: closed 1:7→36:1 with cross_surah; pass 1:7 advances, pass 36:1 ends."""
+    next_ref = quran_service.next_ayah(1, 7, cross_surah=True)
+    assert next_ref == (36, 1)
+    ayah7 = quran_service.get_ayah(1, 7)["text"]
+    ayah_next = quran_service.get_ayah(36, 1)["text"]
+    recognizer = MockSpeechRecognizer(transcripts=[ayah7, ayah_next])
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=7,
+        end_surah=36,
+        end_ayah=1,
+        threshold=0.5,
+        fail_policy="retry",
+        cross_surah=True,
+        partials=False,
+        auto_advance=True,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="force")
+    assert any(e["type"] == "session.advance" for e in events)
+    assert session.current_surah == 36 and session.current_ayah == 1
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events2 = session.run_assess(reason="force")
+    assert any(
+        e["type"] == "session.summary" and e["reason"] == "range_complete"
+        for e in events2
+    )
+
+
+def test_cross_surah_corpus_end_quran_complete(quran_service: QuranService):
+    """S5: last ayah of last fixture surah + open + cross_surah → quran_complete."""
+    last_surah = max(s["number"] for s in quran_service.data)
+    last_ayah = quran_service.last_ayah_number(last_surah)
+    assert quran_service.next_ayah(last_surah, last_ayah, cross_surah=True) is None
+    ayah = quran_service.get_ayah(last_surah, last_ayah)["text"]
+    recognizer = MockSpeechRecognizer(transcript=ayah)
+    cfg = StreamSessionConfig(
+        start_surah=last_surah,
+        start_ayah=last_ayah,
+        threshold=0.5,
+        fail_policy="retry",
+        cross_surah=True,
+        partials=False,
+        auto_advance=True,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.buffer.append_pcm_s16le(_pcm_tone(500, amp=0.2))
+    events = session.run_assess(reason="force")
+    assert any(
+        e["type"] == "session.summary" and e["reason"] == "quran_complete"
+        for e in events
+    )
+
+
 def test_validate_rejects_bad_threshold(quran_service: QuranService):
     recognizer = MockSpeechRecognizer()
     session, err = StreamSession.validate_and_build(

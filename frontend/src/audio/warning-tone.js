@@ -3,7 +3,7 @@
 export const WARNING_TONE = {
   frequency: 660,
   duration: 0.3,
-  gain: 0.2,
+  gain: 0.35,
 };
 
 let sharedContext = null;
@@ -13,21 +13,61 @@ function audioContextCtor() {
   return globalThis.AudioContext || globalThis.webkitAudioContext || null;
 }
 
+function contextUsable(ctx) {
+  return Boolean(
+    ctx &&
+      typeof ctx.createOscillator === "function" &&
+      ctx.state !== "closed",
+  );
+}
+
 function getSharedContext() {
   const Ctor = audioContextCtor();
   if (!Ctor) {
     return null;
   }
-  if (!sharedContext || sharedContext.state === "closed") {
+  if (!contextUsable(sharedContext)) {
     sharedContext = new Ctor();
   }
   return sharedContext;
 }
 
 /**
+ * Unlock / resume the dedicated playback context during a user gesture
+ * (Start Recording / Start Recitation). Capture graphs are often muted or
+ * closed by the time a fail result arrives — do not rely on them alone.
+ */
+export async function primeWarningAudio() {
+  const ctx = getSharedContext();
+  if (!ctx) {
+    return null;
+  }
+  if (ctx.state === "suspended" && typeof ctx.resume === "function") {
+    try {
+      await ctx.resume();
+    } catch {
+      /* autoplay may still block */
+    }
+  }
+  return ctx;
+}
+
+async function resumeIfNeeded(ctx) {
+  if (ctx && ctx.state === "suspended" && typeof ctx.resume === "function") {
+    try {
+      await ctx.resume();
+    } catch {
+      /* autoplay may still block */
+    }
+  }
+  return ctx;
+}
+
+/**
  * Play the warning oscillator on speakers.
- * Prefer a live capture AudioContext (mic already unlocked it). Never connect
- * into the PCM processor graph — only `audioContext.destination`.
+ * Prefer a gesture-primed shared playback context (default sample rate). Fall
+ * back to a live capture AudioContext if shared is still suspended. Never
+ * connect into the PCM processor graph — only `audioContext.destination`.
  *
  * @param {{ audioContext?: AudioContext | null }} [options]
  */
@@ -35,17 +75,16 @@ export async function playWarningTone({ audioContext } = {}) {
   if (tonePlaying) {
     return;
   }
-  const ctx = audioContext || getSharedContext();
-  if (!ctx || typeof ctx.createOscillator !== "function") {
-    return;
-  }
-  if (ctx.state === "suspended" && typeof ctx.resume === "function") {
-    try {
-      await ctx.resume();
-    } catch {
-      /* autoplay may still block; try to start anyway */
+  let ctx = await primeWarningAudio();
+  if (!contextUsable(ctx) || ctx.state !== "running") {
+    if (contextUsable(audioContext)) {
+      ctx = await resumeIfNeeded(audioContext);
     }
   }
+  if (!contextUsable(ctx)) {
+    return;
+  }
+  await resumeIfNeeded(ctx);
   if (tonePlaying) {
     return;
   }
@@ -53,10 +92,12 @@ export async function playWarningTone({ audioContext } = {}) {
   try {
     const oscillator = ctx.createOscillator();
     const gain = ctx.createGain();
+    oscillator.type = "sine";
     oscillator.connect(gain);
     gain.connect(ctx.destination);
-    oscillator.frequency.value = WARNING_TONE.frequency;
-    gain.gain.value = WARNING_TONE.gain;
+    const t0 = ctx.currentTime || 0;
+    oscillator.frequency.setValueAtTime(WARNING_TONE.frequency, t0);
+    gain.gain.setValueAtTime(WARNING_TONE.gain, t0);
     const finish = () => {
       try {
         oscillator.disconnect();
@@ -67,8 +108,8 @@ export async function playWarningTone({ audioContext } = {}) {
       tonePlaying = false;
     };
     oscillator.onended = finish;
-    oscillator.start();
-    oscillator.stop((ctx.currentTime || 0) + WARNING_TONE.duration);
+    oscillator.start(t0);
+    oscillator.stop(t0 + WARNING_TONE.duration);
   } catch {
     tonePlaying = false;
   }

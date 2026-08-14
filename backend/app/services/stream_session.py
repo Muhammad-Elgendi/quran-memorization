@@ -1035,7 +1035,11 @@ class StreamSession:
             cross_surah=self.config.cross_surah,
         )
         if nxt is None:
-            return [self.summary_event("surah_complete")]
+            # Open + cross_surah means corpus end; otherwise surah wall.
+            reason = (
+                "quran_complete" if self.config.cross_surah else "surah_complete"
+            )
+            return [self.summary_event(reason)]
 
         self.current_surah, self.current_ayah = nxt
         self.index_in_session += 1
