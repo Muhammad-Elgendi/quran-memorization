@@ -46,8 +46,8 @@ describe("preferredSampleRate", () => {
 });
 
 describe("resolveDenoiseMode", () => {
-  it("defaults to dtln", () => {
-    expect(resolveDenoiseMode()).toBe("dtln");
+  it("defaults to off", () => {
+    expect(resolveDenoiseMode()).toBe("off");
   });
 });
 

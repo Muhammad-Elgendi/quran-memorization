@@ -2,11 +2,11 @@
 
 /** @returns {DenoiseMode} */
 export function resolveDenoiseMode() {
-  const raw = import.meta.env.VITE_AUDIO_DENOISE ?? "dtln";
+  const raw = import.meta.env.VITE_AUDIO_DENOISE ?? "off";
   if (raw === "off" || raw === "native" || raw === "dtln" || raw === "fastenhancer") {
     return raw;
   }
-  return "dtln";
+  return "off";
 }
 
 /** @returns {'native'|'off'} */

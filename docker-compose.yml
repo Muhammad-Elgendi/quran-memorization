@@ -53,6 +53,7 @@ services:
       args:
         # Empty base URL → browser calls same origin; nginx proxies /api.
         VITE_API_BASE_URL: ""
+        VITE_AUDIO_DENOISE: "off"
     image: quran-memorization-frontend:local
     ports:
       - "5173:80"
