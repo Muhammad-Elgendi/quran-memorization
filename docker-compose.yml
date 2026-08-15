@@ -5,7 +5,7 @@ services:
       dockerfile: backend/Dockerfile
     image: quran-memorization-backend:local
     environment:
-      MOONSHINE_MODEL: "UsefulSensors/moonshine-tiny-ar"
+      STT_MODEL: "tarteel-ai/whisper-tiny-ar-quran"
       HF_HOME: /models/huggingface
       HF_HUB_CACHE: /models/huggingface/hub
     volumes:
@@ -28,7 +28,7 @@ services:
       WORD_MATCH_THRESHOLD: "0.75"
       MIN_AUDIO_SECONDS: "0.5"
       MAX_AUDIO_SECONDS: "20.0"
-      MOONSHINE_MODEL: "UsefulSensors/moonshine-tiny-ar"
+      STT_MODEL: "tarteel-ai/whisper-tiny-ar-quran"
       CORS_ORIGINS: "*"
       HF_HOME: /models/huggingface
       HF_HUB_CACHE: /models/huggingface/hub

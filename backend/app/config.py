@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     MAX_AUDIO_SECONDS: float = 20.0
     MAX_UPLOAD_BYTES: int = 5 * 1024 * 1024
 
-    MOONSHINE_MODEL: str = "UsefulSensors/moonshine-tiny-ar"
+    STT_MODEL: str = "tarteel-ai/whisper-tiny-ar-quran"
 
     # Realtime WebSocket stream (Phase 2) — tuned for low CPU.
     STREAM_SILENCE_MS: int = 800
@@ -60,8 +60,8 @@ class Settings(BaseSettings):
     STT_SEQUENCE_CONFIDENCE_MIN: float = 0.50
     STT_MAX_NEW_TOKENS: int = 64
     STT_PARTIAL_MAX_OVERGEN_RATIO: float = 2.0
-    # Lab 2026-08-14: Tiny greedy softmax is not on the Accuracy-slider scale.
-    # p**gamma maps typical speech (~0.28+) to ≥0.85 and screenshot garbage (~0.12–0.22) below.
+    # Decoder softmax → Accuracy slider. Lab 2026-08-14 (Moonshine Tiny) set
+    # 0.12; Whisper identity (1.0) is preferred after L5. Keep 0.12 until then.
     STT_DECODER_PROB_GAMMA: float = 0.12
     # Ayah-constrained Heard recovery (Uthmani↔STT / agglutination / in-vocab revive).
     STT_AYAH_LEXICON_RECOVERY: bool = True

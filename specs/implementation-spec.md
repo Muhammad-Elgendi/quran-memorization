@@ -3,7 +3,7 @@
 **Status:** Ready for implementation  
 **Source:** `first-spec.md`  
 **Version:** 1.0  
-**Last updated:** 2026-08-13
+**Last updated:** 2026-08-16
 
 ---
 
@@ -22,7 +22,7 @@ The backend must expose a clean **REST API** so the same server can later serve 
 | ID | Goal |
 |----|------|
 | G1 | Serve the full Uthmani Quran corpus (114 surahs, ayah-level) via REST |
-| G2 | Accept browser-recorded audio and transcribe with Moonshine Arabic Tiny |
+| G2 | Accept browser-recorded audio and transcribe with Tarteel Whisper Tiny AR Quran |
 | G3 | Normalize Arabic for comparison (do **not** mutate the stored corpus) |
 | G4 | Score recitation vs expected ayah; surface missing / extra / wrong words |
 | G5 | Configurable pass threshold (default 85%) |
@@ -35,14 +35,14 @@ The backend must expose a clean **REST API** so the same server can later serve 
 - Real-time / streaming word-by-word feedback (Phase 2)
 - Tajweed scoring (madd, ghunnah, etc.)
 - User accounts, cloud sync, or progress persistence (Phase 2+)
-- Fine-tuned Quran-specific ASR (Phase 3)
+- Fine-tuned larger Quran ASR (e.g. whisper-base); live STT is Whisper Tiny AR Quran
 - Mobile/Flutter client (consumes same API later; not built in Phase 1)
 - Scraping Quran text from arbitrary websites
 
 ### 2.3 Design principles
 
 1. **Never compare raw Quran strings directly** — always go through a normalization layer used only for comparison.
-2. **STT behind an interface** — `SpeechRecognizer.transcribe(path) -> str` so Moonshine can be swapped later.
+2. **STT behind an interface** — `SpeechRecognizer.transcribe(path) -> str` so the ASR checkpoint can be swapped later.
 3. **Corpus is immutable** — display/store Uthmani text as-is; normalize only copies used for matching.
 4. **Backend owns assessment** — clients send audio + target ayah; clients do not implement Arabic logic.
 5. **Verify religious text** before any public/production release against a trusted source (e.g. Tanzil-derived).
@@ -56,21 +56,21 @@ Browser (Vue.js)
        │
        │ REST (HTTP multipart for audio)
        ▼
-┌─────────────────────────────────────┐
-│           FastAPI Backend           │
-│                                     │
-│  Quran API                          │
-│  ├── GET surahs / surah / ayah      │
-│                                     │
-│  Memorization API                   │
-│  └── POST assess (audio + target)   │
-│                                     │
-│  Services                           │
-│  ├── QuranService                   │
-│  ├── SpeechRecognizer (Moonshine)   │
-│  ├── ArabicNormalizer               │
-│  └── MemorizationAssessor           │
-└──────────────────┬──────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                   FastAPI Backend                        │
+│                                                          │
+│  Quran API                                               │
+│  ├── GET surahs / surah / ayah                           │
+│                                                          │
+│  Memorization API                                        │
+│  └── POST assess (audio + target)                        │
+│                                                          │
+│  Services                                                │
+│  ├── QuranService                                        │
+│  ├── SpeechRecognizer (Tarteel Whisper Tiny AR Quran)    │
+│  ├── ArabicNormalizer                                    │
+│  └── MemorizationAssessor                                │
+└────────────────────────┬─────────────────────────────────┘
                    │
                    ▼
             data/quran.json
@@ -83,7 +83,7 @@ Browser (Vue.js)
 ```text
 Canonical ayah text ──┐
                       ├──► Normalizer ──► Alignment + Score ──► AssessmentResult
-Moonshine transcript ─┘
+Whisper transcript   ─┘
 ```
 
 ---
@@ -146,7 +146,7 @@ quran-memorization/
 | `WORD_MATCH_THRESHOLD` | float | `0.75` | Word considered wrong below this |
 | `MIN_AUDIO_SECONDS` | float | `0.5` | Reject shorter uploads |
 | `MAX_AUDIO_SECONDS` | float | `20.0` | Reject longer uploads (MVP single-ayah) |
-| `MOONSHINE_MODEL` | str | `"UsefulSensors/moonshine-tiny-ar"` | HF model id |
+| `STT_MODEL` | str | `"tarteel-ai/whisper-tiny-ar-quran"` | HF model id |
 | `CORS_ORIGINS` | list[str] | `["*"]` | Tighten for production |
 
 Load from `.env` via `pydantic-settings`. Resolve `QURAN_FILE` as an absolute path from the backend package root.
@@ -264,13 +264,13 @@ SpeechRecognizer (ABC)
   transcribe(audio_path: str) -> str
 ```
 
-### 9.2 Implementation: `MoonshineArabicRecognizer`
+### 9.2 Implementation: `WhisperQuranRecognizer`
 
-- Lazy-load model on first `transcribe` (server starts without blocking on ~112 MB download/load).
-- Model: `UsefulSensors/moonshine-tiny-ar` via Transformers `AutoProcessor` + `AutoModelForSpeechSeq2Seq`.
-- Audio: mono, 16 kHz (`librosa.load`).
-- Inference: `model.generate` under `torch.no_grad()`; decode with `skip_special_tokens=True`.
-- Return stripped Arabic string.
+- Lazy-load model on first `transcribe` (server starts without blocking on ~150–160 MB download/load).
+- Model: `tarteel-ai/whisper-tiny-ar-quran` via Transformers `AutoProcessor` + `AutoModelForSpeechSeq2Seq`.
+- Audio: mono, 16 kHz (`librosa.load`). Whisper encoder window is 30 s; clamp to the **tail** before the processor (Continuous ring buffer can be 45 s).
+- Inference: `model.generate(input_features, language="ar", task="transcribe")` under `torch.no_grad()`; decode with `skip_special_tokens=True` then strip leftover `<|…|>` control tokens.
+- Return stripped Arabic string. Live model switch: `specs/whisper-tiny-ar-quran-switch-spec.md`.
 
 ### 9.3 Audio constraints (API layer)
 
@@ -498,12 +498,11 @@ huggingface_hub
 transformers
 torch
 torchaudio
-moonshine-voice
 datasets
 requests
 ```
 
-**Note:** Prefer Moonshine’s documented runtime when stable; Transformers path is the specified Phase 1 path for `UsefulSensors/moonshine-tiny-ar`. Keep `torch` required for that path.
+**Note:** Transformers is the specified path for `tarteel-ai/whisper-tiny-ar-quran`. Keep `torch` required. Do not add `openai-whisper` / Faster-Whisper.
 
 ### 15.2 Frontend
 
@@ -519,7 +518,7 @@ requests
 1. Upgrade pip
 2. `pip install -r backend/requirements.txt`
 3. Run `backend/download_quran.py`
-4. Optionally prefetch model via `huggingface_hub` download of `UsefulSensors/moonshine-tiny-ar` (first `from_pretrained` also downloads)
+4. Optionally prefetch model via `huggingface_hub` download of `tarteel-ai/whisper-tiny-ar-quran` (first `from_pretrained` also downloads)
 5. Print how to start backend and frontend
 
 ### 16.2 Developer run
@@ -555,7 +554,7 @@ cd frontend && npm install && npm run dev
 
 - [ ] Project skeleton as in §4
 - [ ] Config, normalizer, Quran service, download script
-- [ ] Moonshine recognizer behind ABC
+- [ ] Whisper Quran recognizer behind ABC
 - [ ] Assessor with **sequence alignment** (not naive zip-by-index)
 - [ ] Quran + assess REST endpoints + health
 - [ ] Vue client: select, record, upload, results, warning tone
@@ -631,7 +630,7 @@ cd frontend && npm install && npm run dev
 4. Diacritic-only differences do not cause false failure at default threshold for a clean reading (manual spot-check).
 5. Clear substitution (e.g. رحيم vs عليم style case on a short phrase) surfaces in `wrong_words`.
 6. Failed assessment plays a warning tone once.
-7. STT is only referenced through `SpeechRecognizer`; no Moonshine imports in API routers beyond the service module.
+7. STT is only referenced through `SpeechRecognizer`; no STT model imports in API routers.
 8. `install.py` documents and performs dependency + corpus setup successfully on a clean venv.
 
 ---
@@ -640,7 +639,7 @@ cd frontend && npm install && npm run dev
 
 | Topic | Default for Phase 1 | Alternative |
 |-------|---------------------|-------------|
-| STT runtime | Transformers HF model | `moonshine-voice` package API if equivalent quality |
+| STT runtime | Transformers HF model (`tarteel-ai/whisper-tiny-ar-quran`) | Larger Whisper (out of scope) |
 | Alignment algo | `difflib.SequenceMatcher` on tokens | Needleman–Wunsch / `jiwer` alignment |
 | Taa marbuta | Leave as-is after other norms | Map `ة` → `ه` |
 | Surah names | Fill from static map post-download | Leave empty until enrichment |
@@ -660,14 +659,14 @@ POST /api/memorization/assess
 GET  /health
 ```
 
-No knowledge of Python, Transformers, Moonshine, or corpus format is required on the client.
+No knowledge of Python, Transformers, Whisper internals, or corpus format is required on the client.
 
 ---
 
 ## 23. Reference links
 
-- Moonshine: https://github.com/moonshine-ai/moonshine
-- Model: https://huggingface.co/UsefulSensors/moonshine-tiny-ar
+- STT model: https://huggingface.co/tarteel-ai/whisper-tiny-ar-quran
+- Live STT switch: `specs/whisper-tiny-ar-quran-switch-spec.md`
 - Corpus: https://huggingface.co/datasets/arbml/quran_uthmani
 - Alt corpus: https://huggingface.co/datasets/quranlab/quran
 - Trusted text reference: https://github.com/nuqayah/quran-text

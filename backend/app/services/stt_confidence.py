@@ -90,7 +90,7 @@ def _piece_with_word_breaks(piece: str) -> str:
 
 
 def calibrate_decoder_prob(p: float, *, gamma: float | None = None) -> float:
-    """Map Moonshine Tiny greedy softmax onto the Accuracy-slider scale.
+    """Map decoder softmax onto the Accuracy-slider scale.
 
     Lab (2026-08-14): raw *P* ≥ 0.85 emptied REST Heard and dropped الرحمن
     from 1:3 while الرحيم survived. Power map keeps typical speech and still

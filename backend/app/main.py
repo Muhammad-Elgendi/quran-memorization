@@ -6,7 +6,7 @@ from .api.memorization_stream import create_router as create_stream_router
 from .api.quran import create_router as create_quran_router
 from .config import QURAN_FILE, settings
 from .services.quran_service import QuranService
-from .services.speech_service import MoonshineArabicRecognizer
+from .services.speech_service import WhisperQuranRecognizer
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -27,8 +27,8 @@ app.add_middleware(
 )
 
 quran_service = QuranService(QURAN_FILE)
-# Share one recognizer instance so Moonshine loads once for REST + WS.
-speech_recognizer = MoonshineArabicRecognizer()
+# Share one recognizer instance so Whisper loads once for REST + WS.
+speech_recognizer = WhisperQuranRecognizer()
 
 app.include_router(create_quran_router(quran_service))
 app.include_router(

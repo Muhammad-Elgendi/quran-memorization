@@ -10,13 +10,16 @@
 #
 # Persistence:
 #   - PVC `quran-data` (1Gi) — Uthmani corpus JSON
-#   - PVC `hf-model-cache` (5Gi, RWO) — Moonshine weights at /models/huggingface
+#   - PVC `hf-model-cache` (5Gi, RWO) — Tarteel Whisper Tiny AR Quran (~150–160 MB)
+#     at /models/huggingface. Label purpose: stt-model-cache.
 #
 # The backend pod runs initContainer `prefetch-stt-model` first. On a cold PVC it
-# downloads ~112MB from Hugging Face; later pod starts reuse the volume and skip
-# the download. Keep backend replicas=1 while the claim is ReadWriteOnce.
+# downloads ~150–160MB from Hugging Face; later pod starts reuse the volume and skip
+# the download. A volume that only holds leftover Moonshine blobs will fetch Tarteel
+# into the same 5Gi claim (enough for both). Keep backend replicas=1 while the
+# claim is ReadWriteOnce.
 #
-# Wipe the STT cache (forces re-download on next roll):
+# Wipe the STT cache only if you want to reclaim Moonshine bytes:
 #   kubectl -n quran-memorization delete pvc hf-model-cache
 #   kubectl apply -f k8s/deploy.yaml
 #

@@ -9,7 +9,7 @@ Local-first Phase 1 MVP. Specs: `implementation-spec.md` (authoritative) over `f
 
 ## Stack
 
-- **Backend:** FastAPI (`backend/app/`), Moonshine Arabic Tiny via Transformers, `data/quran.json`
+- **Backend:** FastAPI (`backend/app/`), Tarteel Whisper Tiny AR Quran via Transformers, `data/quran.json`
 - **Frontend:** Vue 3 + Vite (`frontend/`), REST only (no WebSocket yet)
 - **Local:** `docker compose up --build` → app `:5173`, API `:8000/docs`
 - **K8s:** `k8s/deploy.yaml` (backend + frontend + PVCs + Ingress)
@@ -17,7 +17,7 @@ Local-first Phase 1 MVP. Specs: `implementation-spec.md` (authoritative) over `f
 ## Non-negotiables
 
 1. Never mutate stored Quran text; normalize only comparison copies (`services/normalizer.py`).
-2. STT only through `SpeechRecognizer` — no Moonshine imports in API routers.
+2. STT only through `SpeechRecognizer` — no STT model imports in API routers.
 3. Assessment uses sequence alignment (`difflib.SequenceMatcher`), not naive zip-by-index.
 4. Clients send audio + target ayah; Arabic logic stays on the backend.
 5. Verify corpus against a trusted Uthmani source before any production/public release.

@@ -1,4 +1,4 @@
-"""Download Moonshine weights into HF_HOME (Compose volume / K8s PVC).
+"""Download Tarteel Whisper Tiny AR Quran weights into HF_HOME (Compose / K8s).
 
 Hugging Face Hub stores snapshots at ``$HF_HOME/hub/models--...``.
 Do not set TRANSFORMERS_CACHE to HF_HOME — that makes ``from_pretrained``
@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-DEFAULT_MODEL = "UsefulSensors/moonshine-tiny-ar"
+DEFAULT_MODEL = "tarteel-ai/whisper-tiny-ar-quran"
 CONTAINER_HF_HOME = "/models/huggingface"
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".ckpt")
 
@@ -54,7 +54,7 @@ def cached_snapshot_path(repo_id: str) -> Path | None:
 
 
 def prefetch_model(repo_id: str | None = None) -> str:
-    repo_id = repo_id or os.environ.get("MOONSHINE_MODEL") or DEFAULT_MODEL
+    repo_id = repo_id or os.environ.get("STT_MODEL") or DEFAULT_MODEL
     home = hf_home()
     home.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(home))

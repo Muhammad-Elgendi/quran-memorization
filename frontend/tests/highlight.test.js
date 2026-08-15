@@ -64,4 +64,35 @@ describe("heardTextFromMessage", () => {
       })
     ).toBe("نستعين");
   });
+
+  it("strips Whisper prefix tokens from recognized", () => {
+    expect(
+      heardTextFromMessage({
+        recognized: "<|startoftranscript|><|ar|>بسم الله",
+      })
+    ).toBe("بسم الله");
+  });
+
+  it("strips timestamp tokens from recognized", () => {
+    expect(
+      heardTextFromMessage({
+        recognized: "<|0.00|>الحمد<|0.64|>",
+      })
+    ).toBe("الحمد");
+  });
+
+  it("drops kept words that are only decoder tokens", () => {
+    expect(
+      heardTextFromMessage({
+        words: [
+          { text: "<|ar|>", kept: true },
+          { text: "الرحمن", kept: true },
+        ],
+      })
+    ).toBe("الرحمن");
+  });
+
+  it("leaves clean Arabic unchanged", () => {
+    expect(heardTextFromMessage({ recognized: "الحمد لله" })).toBe("الحمد لله");
+  });
 });

@@ -32,7 +32,7 @@ def main() -> None:
     print("\nDownloading Quran corpus...")
     run([sys.executable, str(ROOT / "backend" / "download_quran.py")])
 
-    print("\nPrefetching Moonshine Arabic Tiny into the Hugging Face cache...")
+    print("\nPrefetching Tarteel Whisper Tiny AR Quran into the Hugging Face cache...")
     try:
         run([sys.executable, str(ROOT / "backend" / "prefetch_model.py")])
     except Exception as exc:  # noqa: BLE001

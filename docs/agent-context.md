@@ -5,8 +5,9 @@
 **Authoritative product specs:**
 - Phase 1 REST: `specs/implementation-spec.md`
 - Phase 2 stream: `specs/realtime-stream-spec.md`
+- Live STT: `specs/whisper-tiny-ar-quran-switch-spec.md`
 
-**Last updated:** 2026-08-15 (multi-utterance credit in Continuous)
+**Last updated:** 2026-08-16 (Tarteel Whisper Tiny AR Quran STT)
 
 ---
 
@@ -18,7 +19,7 @@ Local-first Quran memorization assessor:
 
 1. User selects surah + ayah in a Vue UI.
 2. Records audio in the browser (`MediaRecorder` → `audio/webm`).
-3. Backend transcribes with **Moonshine Arabic Tiny** (`UsefulSensors/moonshine-tiny-ar` via Hugging Face Transformers).
+3. Backend transcribes with **Tarteel Whisper Tiny AR Quran** (`tarteel-ai/whisper-tiny-ar-quran` via Hugging Face Transformers). Live switch: `specs/whisper-tiny-ar-quran-switch-spec.md`.
 4. Arabic **normalization** (comparison only) + **sequence-aligned** scoring vs canonical Uthmani text.
 5. Returns score, pass/fail, missing/extra/wrong words; UI plays a ~660 Hz warning tone on fail.
 
@@ -31,7 +32,7 @@ Local-first Quran memorization assessor:
 5. Auto-advance on pass; UI fail policies: **continue** | **stop** (server also supports `retry`).
 6. **Partials default ON** (`STREAM_PARTIALS_DEFAULT=true`) with unified completion probe (~1 s). Mid-utterance partials are **provisional** (UI does not lock red chips until `ayah.result`). Coverage auto-finalize needs `STREAM_COVERAGE_STABLE_TICKS` (default 2) consecutive high-coverage ticks.
 7. Vue mode toggle: Single ayah (REST) vs Continuous (WS).
-8. **STT confidence filter:** Moonshine `generate(..., output_scores=True)` → drop Heard words with **calibrated** decoder *P* below Accuracy *T* (default 0.85). Tiny softmax is mapped with `p ** STT_DECODER_PROB_GAMMA` (0.12) first — raw *P* ≥ 0.85 emptied real Fatihah. Sequence confidence below 0.50 dumps the whole decode. `transcribe()` still returns the filtered string.
+8. **STT confidence filter:** Whisper `generate(..., output_scores=True)` → drop Heard words with **calibrated** decoder *P* below Accuracy *T* (default 0.85). Decoder softmax is mapped with `p ** STT_DECODER_PROB_GAMMA` (0.12 until the Whisper L5 lab) first — raw *P* ≥ 0.85 emptied real Fatihah on Moonshine. Sequence confidence below 0.50 dumps the whole decode. `transcribe()` still returns the filtered string.
 9. **Ayah-constrained Heard recovery** (after the confidence filter): agglutinated STT tokens like `بسمالله` are split against consecutive expected ayah words; dropped in-vocab words with confidence ≥ `STT_INVOCAB_FLOOR` (0.55) are revived in decode order. Expected remains corpus Uthmani; comparison still goes through the normalizer. Does **not** invent words that never appeared in the decode.
 10. **Energy gates (do not conflate):**
     - `STREAM_VAD_RMS_THRESHOLD` (0.015) — speech vs silence for utterance boundaries.
@@ -42,7 +43,7 @@ Local-first Quran memorization assessor:
 13. **Cross-surah Continuous default:** `cross_surah: true` and End ayah **Until I stop** (open / no `end_*`). Passing the last ayah of a surah advances to the next surah ayah 1 and keeps the mic on. A closed End ayah still ends with `range_complete`. See `specs/cross-surah-advance-spec.md`.
 14. **Multi-utterance word credit:** Continuous keeps a contiguous **credit cursor** on the current ayah across silence boundaries. Each STT window merges via full / suffix / resume-at-cursor alignment (`merge_credit` in `assessor.py`). When the cursor reaches N → `ayah.result` `passed=true` + `credit_complete` + auto-advance (even if the last window is only a suffix). Live `partial.alignment.progress` is **cumulative**; `window_coverage` is optional debug. REST Single unchanged. Spec: `specs/multi-utterance-credit-spec.md`. Implementation notes: `docs/multi-utterance-credit.md`.
 
-**Still out of scope:** tajweed, accounts/progress DB, Quran-fine-tuned ASR, leftover-carry for pause-less tilawah (v1.1), multi-replica sticky sessions.
+**Still out of scope:** tajweed, accounts/progress DB, leftover-carry for pause-less tilawah (v1.1), multi-replica sticky sessions, larger Whisper checkpoints.
 
 ---
 
@@ -172,14 +173,17 @@ Implemented in `backend/app/services/normalizer.py`:
 
 ---
 
-## 8. Speech / Moonshine
+## 8. Speech / STT
 
-- Model: `UsefulSensors/moonshine-tiny-ar` (~112MB)
+- Model: `tarteel-ai/whisper-tiny-ar-quran` (~150–160 MB); class `WhisperQuranRecognizer`
+- Env: `STT_MODEL` (do not revive `MOONSHINE_MODEL`)
 - Lazy-load into RAM on first `transcribe`; **disk prefetch** on Compose/K8s start
-- Audio for STT: mono 16 kHz float samples
+- Audio for STT: mono 16 kHz float samples; recognizer clamps to the **last 30 s** before the Whisper processor
+- Generate: `input_features` + `language="ar"` / `task="transcribe"`; skip special tokens then strip leftover `<|…|>`
 - HF cache: `/models/huggingface` (`HF_HOME`), snapshots under `hub/` (`HF_HUB_CACHE`)
+- Prefetch cache key: `models--tarteel-ai--whisper-tiny-ar-quran` — leftover Moonshine blobs do **not** skip the Tarteel download
 - Compose: named volume `hf_cache`; service `model-prefetch` runs `prefetch_model.py` before backend
-- K8s: PVC `hf-model-cache`; initContainer `prefetch-stt-model` (skip-if-cached)
+- K8s: PVC `hf-model-cache` (label `purpose: stt-model-cache`); initContainer `prefetch-stt-model` (skip-if-cached)
 - Do **not** set `TRANSFORMERS_CACHE` to the same path as `HF_HOME` (cache-layout mismatch → re-download)
 - Unauthenticated HF Hub warning in logs is noisy but OK if model is already cached
 
@@ -250,7 +254,7 @@ docker compose exec backend bash -c '
 - Frontend published at **5173→80** (nginx), API at **8000**
 - Nginx proxies `/api/` and `/health` to `backend:8000`
 - Named volumes: `quran_data`, `hf_cache`
-- One-shot `model-prefetch` service writes Moonshine into `hf_cache` before backend starts
+- One-shot `model-prefetch` service writes Tarteel Whisper Tiny AR Quran into `hf_cache` before backend starts
 - Healthcheck on backend `/health`; frontend waits until healthy
 
 **Dev (`docker-compose.dev.yml`):**
@@ -270,7 +274,7 @@ docker compose exec backend bash -c '
 - Namespace: `quran-memorization`
 - Images expected: `quran-memorization-backend:latest`, `quran-memorization-frontend:latest`
 - Frontend nginx assumes Service DNS name **`backend`**
-- PVCs: `quran-data` (corpus), `hf-model-cache` (Moonshine); initContainer prefetches STT weights
+- PVCs: `quran-data` (corpus), `hf-model-cache` (STT); initContainer prefetches Tarteel Whisper Tiny AR Quran
 - Ingress example host: `quran.local` (nginx ingress annotations for 6m body / 300s read timeout)
 - Load images into kind/minikube before apply (see `k8s/README.md`)
 
