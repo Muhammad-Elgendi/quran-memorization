@@ -38,6 +38,18 @@ export function wordsFromAlignment(text, alignment, options = {}) {
   return words.map((word, i) => ({ word, status: statuses[i] }));
 }
 
+const WHISPER_ANGLE_TOKEN = /<\|[^|>]*\|>/g;
+
+/**
+ * Strip Whisper control / timestamp tokens that must never reach Heard.
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripDecoderSpecialTokens(text) {
+  const cleaned = String(text || "").replace(WHISPER_ANGLE_TOKEN, " ");
+  return cleaned.split(/\s+/).filter(Boolean).join(" ");
+}
+
 /**
  * Heard line from a stream/REST payload: kept decoder words only, else `recognized`.
  * Never uses `raw_text` / `raw_recognized`.
@@ -51,8 +63,12 @@ export function heardTextFromMessage(msg) {
   if (Array.isArray(msg.words) && msg.words.length) {
     const kept = msg.words.filter((word) => word && word.kept === true && word.text);
     if (kept.length) {
-      return kept.map((word) => word.text).join(" ");
+      const joined = kept
+        .map((word) => stripDecoderSpecialTokens(word.text))
+        .filter(Boolean)
+        .join(" ");
+      return stripDecoderSpecialTokens(joined);
     }
   }
-  return (msg.recognized || "").trim();
+  return stripDecoderSpecialTokens(msg.recognized || "");
 }

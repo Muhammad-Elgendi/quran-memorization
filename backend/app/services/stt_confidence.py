@@ -90,11 +90,11 @@ def _piece_with_word_breaks(piece: str) -> str:
 
 
 def calibrate_decoder_prob(p: float, *, gamma: float | None = None) -> float:
-    """Map Moonshine Tiny greedy softmax onto the Accuracy-slider scale.
+    """Map decoder softmax onto the Accuracy-slider scale.
 
-    Lab (2026-08-14): raw *P* ≥ 0.85 emptied REST Heard and dropped الرحمن
-    from 1:3 while الرحيم survived. Power map keeps typical speech and still
-    drops the screenshot hallucination band (~0.12–0.22).
+    Whisper Tiny AR Quran (L5, 2026-08-20): identity (gamma 1.0). Moonshine
+    used 0.12 because Tiny greedy sat ~0.28 on real speech; that map lets
+    Whisper junk (~0.5–0.6 raw) pass Accuracy *T* as ~0.93.
     """
     prob = min(1.0, max(0.0, float(p)))
     g = settings.STT_DECODER_PROB_GAMMA if gamma is None else float(gamma)
@@ -345,6 +345,53 @@ def _fuzzy_ok(left: str, right: str, match_floor: float) -> bool:
     return fuzz.ratio(left, right) / 100.0 >= match_floor
 
 
+def _edit_distance(left: str, right: str) -> int:
+    """Levenshtein distance for short Arabic tokens."""
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    prev = list(range(len(right) + 1))
+    for i, ca in enumerate(left, start=1):
+        cur = [i]
+        for j, cb in enumerate(right, start=1):
+            ins = cur[j - 1] + 1
+            delete = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            cur.append(min(ins, delete, sub))
+        prev = cur
+    return prev[-1]
+
+
+def _near_miss(left: str, right: str) -> bool:
+    """Single-edit STT confusions (اسم↔بسم, الر↔الم) — lab 2026-08-20."""
+    if not left or not right:
+        return False
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if min(len(left), len(right)) < 2:
+        return False
+    return _edit_distance(left, right) <= 1
+
+
+def _is_truncated_prefix(token: str, expected_token: str) -> bool:
+    """True when STT cut off the end of the expected word (``ينف`` ⊂ ``ينفقون``).
+
+    Lab 2026-08-20: 2:3 finalize tails ``رزق``/``ينف`` vs ``رزقنهم``/``ينفقون``.
+    """
+    if not token or not expected_token:
+        return False
+    if token == expected_token:
+        return False
+    if len(token) < 2:
+        return False
+    if not expected_token.startswith(token):
+        return False
+    return len(token) >= max(2, (len(expected_token) + 1) // 2)
+
+
 def _copy_word(word: TranscriptWord, *, kept: bool | None = None) -> TranscriptWord:
     return TranscriptWord(
         text=word.text,
@@ -354,13 +401,21 @@ def _copy_word(word: TranscriptWord, *, kept: bool | None = None) -> TranscriptW
 
 
 def _try_split(token_norm: str, expected: list[str], start_i: int) -> list[str] | None:
-    """Shortest cover of two or more consecutive expected tokens."""
+    """Shortest cover of two or more consecutive expected tokens.
+
+    Exact join first; for a two-token cover also allow edit-distance ≤ 1 so
+    Whisper drops like ``لريب`` still split onto ``لا``+``ريب`` (``لاريب``).
+    Lab 2026-08-20: 2:2 credit stuck at 2/7 with wrong_words لا←لريب.
+    """
     if start_i >= len(expected) or not token_norm:
         return None
     for end in range(start_i + 2, len(expected) + 1):
-        joined = "".join(expected[start_i:end])
+        parts = expected[start_i:end]
+        joined = "".join(parts)
         if joined == token_norm:
-            return expected[start_i:end]
+            return parts
+        if end == start_i + 2 and _near_miss(joined, token_norm):
+            return parts
         if not token_norm.startswith(joined):
             break
     return None
@@ -429,25 +484,27 @@ def _split_agglutinated(
                 cursor = _advance_cursor(token, expected, cursor, match_floor)
             continue
         token = tokens[0]
+        # Split before fuzzy-any: ``لريب`` ≈ ``ريب`` used to skip the
+        # ``لا``+``ريب`` cover and stick the credit cursor (lab 2:2).
+        found = _try_split_from(token, expected, cursor)
+        if found is not None:
+            start, parts = found
+            splits.append({"from": word.text, "into": list(parts)})
+            for part in parts:
+                out.append(
+                    TranscriptWord(
+                        text=part,
+                        confidence=word.confidence,
+                        kept=True,
+                    )
+                )
+            cursor = start + len(parts)
+            continue
         if any(_fuzzy_ok(token, item, match_floor) for item in expected):
             out.append(_copy_word(word))
             cursor = _advance_cursor(token, expected, cursor, match_floor)
             continue
-        found = _try_split_from(token, expected, cursor)
-        if found is None:
-            out.append(_copy_word(word))
-            continue
-        start, parts = found
-        splits.append({"from": word.text, "into": list(parts)})
-        for part in parts:
-            out.append(
-                TranscriptWord(
-                    text=part,
-                    confidence=word.confidence,
-                    kept=True,
-                )
-            )
-        cursor = start + len(parts)
+        out.append(_copy_word(word))
     return out, splits
 
 
@@ -460,23 +517,43 @@ def _revive_dropped(
     next_i = _longest_prefix_coverage(
         expected, _kept_norm_seq(words), match_floor
     )
+    content_n = sum(1 for word in words if tokenize(word.text))
+    # Short windows (الم alone) may near-miss a later ayah token; longer
+    # windows only near-miss at the credit cursor so الر≠skip-to-الم.
+    allow_skip_near = content_n <= 2
     revived: list[str] = []
     out: list[TranscriptWord] = []
     for word in words:
         if word.kept:
             out.append(_copy_word(word))
             continue
-        if word.confidence < conf_floor:
-            out.append(_copy_word(word))
-            continue
         tokens = tokenize(word.text)
         if len(tokens) != 1:
             out.append(_copy_word(word))
             continue
+        token = tokens[0]
         matched = False
         for idx in range(next_i, len(expected)):
-            if _fuzzy_ok(tokens[0], expected[idx], match_floor):
-                out.append(_copy_word(word, kept=True))
+            exact = token == expected[idx]
+            near = (
+                (not exact)
+                and _near_miss(token, expected[idx])
+                and (idx == next_i or allow_skip_near)
+            )
+            fuzzy = (
+                (not exact)
+                and (not near)
+                and _fuzzy_ok(token, expected[idx], max(match_floor, 0.90))
+            )
+            if exact or near or (fuzzy and word.confidence >= conf_floor):
+                text = expected[idx] if near else word.text
+                out.append(
+                    TranscriptWord(
+                        text=text,
+                        confidence=word.confidence,
+                        kept=True,
+                    )
+                )
                 revived.append(word.text)
                 next_i = idx + 1
                 matched = True
@@ -484,6 +561,65 @@ def _revive_dropped(
         if not matched:
             out.append(_copy_word(word))
     return out, revived
+
+
+def _rewrite_kept_near_misses(
+    words: list[TranscriptWord],
+    expected: list[str],
+    match_floor: float,
+) -> tuple[list[TranscriptWord], list[str]]:
+    """Rewrite high-confidence STT near-misses (اسم kept) onto expected tokens."""
+    rewritten: list[str] = []
+    out: list[TranscriptWord] = []
+    cursor = 0
+    # Count all decode tokens (incl. dropped junk). A lone kept tail like
+    # استعين after يا كلب… must not skip-near to نستعين.
+    content_n = sum(1 for word in words if tokenize(word.text))
+    allow_skip_near = content_n <= 2
+    for word in words:
+        if not word.kept:
+            out.append(_copy_word(word))
+            continue
+        tokens = tokenize(word.text)
+        if len(tokens) != 1 or cursor >= len(expected):
+            out.append(_copy_word(word))
+            continue
+        token = tokens[0]
+        matched_idx = None
+        near_hit = False
+        for idx in range(cursor, len(expected)):
+            if token == expected[idx]:
+                matched_idx = idx
+                break
+            if _near_miss(token, expected[idx]) and (
+                idx == cursor or allow_skip_near
+            ):
+                matched_idx = idx
+                near_hit = True
+                break
+            if _fuzzy_ok(token, expected[idx], match_floor):
+                matched_idx = idx
+                break
+        if matched_idx is None and _is_truncated_prefix(token, expected[cursor]):
+            matched_idx = cursor
+            near_hit = True
+        if matched_idx is None:
+            out.append(_copy_word(word))
+            continue
+        target = expected[matched_idx]
+        if near_hit and token != target:
+            out.append(
+                TranscriptWord(
+                    text=target,
+                    confidence=word.confidence,
+                    kept=True,
+                )
+            )
+            rewritten.append(word.text)
+        else:
+            out.append(_copy_word(word))
+        cursor = matched_idx + 1
+    return out, rewritten
 
 
 def recover_against_ayah(
@@ -496,10 +632,12 @@ def recover_against_ayah(
     """Split agglutinated STT tokens and revive in-vocab drops against the ayah.
 
     Does not invent tokens that never appeared in the decode except by splitting
-    an emitted surface. Does not mutate stored Quran text.
+    an emitted surface or rewriting a single-edit near-miss onto the aligned
+    expected token. Does not mutate stored Quran text.
+
+    Runs even after a ``low_sequence`` dump so exact / near-miss in-vocab tokens
+    (e.g. الم, اسم→بسم) can be recovered when Whisper under-confidences.
     """
-    if transcription.skipped_reason == "low_sequence":
-        return transcription
     expected = tokenize(expected_uthmani)
     if not expected:
         return transcription
@@ -530,9 +668,15 @@ def recover_against_ayah(
         extra_words, extra_splits = _split_agglutinated(words, expected, match_floor)
         words = extra_words
         splits = splits + extra_splits
+    words, rewritten = _rewrite_kept_near_misses(words, expected, match_floor)
+    revived = revived + rewritten
 
     kept_text = " ".join(word.text for word in words if word.kept)
-    if not revived and not splits and kept_text == (transcription.text or ""):
+    if (
+        not revived
+        and not splits
+        and kept_text == (transcription.text or "")
+    ):
         return transcription
 
     skipped = transcription.skipped_reason

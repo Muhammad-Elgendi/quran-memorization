@@ -8,7 +8,7 @@ from ..config import settings
 from ..services.assessor import MemorizationAssessor
 from ..services.audio import prepare_audio
 from ..services.quran_service import QuranService
-from ..services.speech_service import MoonshineArabicRecognizer, SpeechRecognizer
+from ..services.speech_service import SpeechRecognizer, WhisperQuranRecognizer
 from ..services.stt_confidence import (
     apply_ayah_recovery,
     recovery_debug_fields,
@@ -23,7 +23,7 @@ def create_router(
     recognizer: SpeechRecognizer | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/memorization", tags=["Memorization"])
-    speech = recognizer or MoonshineArabicRecognizer()
+    speech = recognizer or WhisperQuranRecognizer()
 
     @router.post("/assess")
     async def assess(

@@ -2,14 +2,14 @@
 
 Local-first Quran memorization practice tool: select an ayah, recite into the microphone, and receive a score with word-level feedback. Use **Single ayah** (REST upload) or **continuous** mode (WebSocket, auto-advance).
 
-The **FastAPI backend** owns corpus serving, speech-to-text (Moonshine Arabic Tiny), Arabic normalization, and assessment. The **Vue** client is one consumer of the same API (Flutter can call the same endpoints later).
+The **FastAPI backend** owns corpus serving, speech-to-text (Tarteel Whisper Tiny AR Quran), Arabic normalization, and assessment. The **Vue** client is one consumer of the same API (Flutter can call the same endpoints later).
 
 ## Architecture
 
 ```text
 Browser (Vue)  --REST /assess-->  FastAPI  -->  Quran JSON
        |                              |
-       +--WS /stream (PCM)------------+-->  Moonshine Arabic Tiny
+       +--WS /stream (PCM)------------+-->  Tarteel Whisper Tiny AR Quran
                                       |
                                       +-->  Normalizer + sequence-aligned assessor
 ```
@@ -40,7 +40,7 @@ Hot-reload developer stack:
 docker compose -f docker-compose.dev.yml up --build
 ```
 
-The Moonshine STT model (~112 MB) is **prefetched** on first `up` into the named volume `hf_cache` (`/models/huggingface`). Later starts reuse it; they do not re-download. Wipe with `docker compose down -v` only if you intend to drop the corpus and model cache.
+The Tarteel Whisper Tiny AR Quran STT model (~150–160 MB) is **prefetched** on first `up` into the named volume `hf_cache` (`/models/huggingface`). Later starts reuse it; they do not re-download. After this model switch, the first `up` is a cold prefetch even if Moonshine was cached (old blobs are leftover, not a cache hit). Wipe with `docker compose down -v` only if you intend to drop the corpus and model cache.
 
 ## Quick start (local venv)
 
@@ -89,7 +89,7 @@ Manifests live in [`k8s/`](k8s/). Build and load images into your cluster, then:
 kubectl apply -f k8s/deploy.yaml
 ```
 
-See [`k8s/README.md`](k8s/README.md) for kind/minikube notes. PVCs hold the Quran JSON (`quran-data`) and the Moonshine cache (`hf-model-cache`); an init container prefetches the STT weights before the API starts. The frontend nginx image proxies `/api` and `/health` to the `backend` Service.
+See [`k8s/README.md`](k8s/README.md) for kind/minikube notes. PVCs hold the Quran JSON (`quran-data`) and the STT cache (`hf-model-cache`); an init container prefetches Tarteel Whisper Tiny AR Quran before the API starts. The frontend nginx image proxies `/api` and `/health` to the `backend` Service.
 
 ## Corpus provenance
 

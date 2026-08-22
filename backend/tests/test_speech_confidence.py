@@ -120,29 +120,29 @@ def test_default_thresholds_unchanged():
     assert settings.WORD_MATCH_THRESHOLD == 0.75
     assert settings.STREAM_COVERAGE_THRESHOLD == 0.85
     assert settings.STT_SEQUENCE_CONFIDENCE_MIN == 0.50
-    assert settings.STT_DECODER_PROB_GAMMA == 0.12
+    assert settings.STT_DECODER_PROB_GAMMA == 1.0
     assert settings.STT_AYAH_LEXICON_RECOVERY is True
     assert settings.STT_INVOCAB_FLOOR == 0.55
 
 
-def test_calibrate_tiny_softmax_onto_slider():
-    """Lab exception: raw Tiny P is not Accuracy T."""
-    assert calibrate_decoder_prob(0.12) < 0.85
-    assert calibrate_decoder_prob(0.22) < 0.85
-    assert calibrate_decoder_prob(0.28) >= 0.85
-    assert calibrate_decoder_prob(0.88) >= 0.90
+def test_calibrate_whisper_identity_keeps_slider_scale():
+    """Whisper L5: gamma 1.0 leaves decoder P on the Accuracy-slider scale."""
+    assert calibrate_decoder_prob(0.12) == pytest.approx(0.12)
+    assert calibrate_decoder_prob(0.57) < 0.85
+    assert calibrate_decoder_prob(0.88) >= 0.85
+    assert calibrate_decoder_prob(0.98) >= 0.90
     kept = filter_transcription(
         "الرحمن الرحيم",
-        [calibrate_decoder_prob(0.32), calibrate_decoder_prob(0.40)],
+        [0.90, 0.92],
         threshold=0.85,
-        sequence_confidence=calibrate_decoder_prob(0.36),
+        sequence_confidence=0.91,
     )
     assert kept.text.split() == ["الرحمن", "الرحيم"]
     dumped = filter_transcription(
         "يا كلب",
-        [calibrate_decoder_prob(0.15), calibrate_decoder_prob(0.18)],
+        [0.57, 0.55],
         threshold=0.85,
-        sequence_confidence=calibrate_decoder_prob(0.16),
+        sequence_confidence=0.56,
     )
     assert dumped.text == ""
 

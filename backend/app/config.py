@@ -25,13 +25,16 @@ class Settings(BaseSettings):
     MAX_AUDIO_SECONDS: float = 20.0
     MAX_UPLOAD_BYTES: int = 5 * 1024 * 1024
 
-    MOONSHINE_MODEL: str = "UsefulSensors/moonshine-tiny-ar"
+    STT_MODEL: str = "tarteel-ai/whisper-tiny-ar-quran"
 
     # Realtime WebSocket stream (Phase 2) — tuned for low CPU.
     STREAM_SILENCE_MS: int = 800
     STREAM_SHORT_SILENCE_MS: int = 400
     STREAM_MIN_UTTERANCE_MS: int = 400
     STREAM_PARTIAL_EVERY_MS: int = 2000
+    # Periodic STT (partials + unified probe) only scores the last N ms so
+    # Whisper latency stays bounded while the ring buffer grows.
+    STREAM_PARTIAL_WINDOW_MS: int = 3000
     STREAM_COMPLETION_PROBE: bool = True
     STREAM_COMPLETION_PROBE_MS: int = 1000
     STREAM_COVERAGE_THRESHOLD: float = 0.85
@@ -60,9 +63,10 @@ class Settings(BaseSettings):
     STT_SEQUENCE_CONFIDENCE_MIN: float = 0.50
     STT_MAX_NEW_TOKENS: int = 64
     STT_PARTIAL_MAX_OVERGEN_RATIO: float = 2.0
-    # Lab 2026-08-14: Tiny greedy softmax is not on the Accuracy-slider scale.
-    # p**gamma maps typical speech (~0.28+) to ≥0.85 and screenshot garbage (~0.12–0.22) below.
-    STT_DECODER_PROB_GAMMA: float = 0.12
+    # Decoder softmax → Accuracy slider. Moonshine lab used 0.12; Whisper Tiny
+    # AR Quran L5 (2026-08-20): identity — gamma 0.12 inflated ~0.57 raw junk to
+    # ~0.94 and kept hallucinations as Heard.
+    STT_DECODER_PROB_GAMMA: float = 1.0
     # Ayah-constrained Heard recovery (Uthmani↔STT / agglutination / in-vocab revive).
     STT_AYAH_LEXICON_RECOVERY: bool = True
     STT_INVOCAB_FLOOR: float = 0.55

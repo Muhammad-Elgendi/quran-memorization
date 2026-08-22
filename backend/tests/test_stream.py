@@ -476,7 +476,87 @@ def test_session_unified_periodic_single_stt(quran_service: QuranService):
     assert alignment["progress"] >= 0.85
     probe = _coverage_probe(session)
     assert any(e.get("type") == "_assess_trigger" for e in probe)
+    # Unchanged ring snapshot reuses the last decode (no second Whisper call).
+    assert recognizer.calls == 1
+
+
+def test_unified_periodic_caps_inference_window(
+    quran_service: QuranService, monkeypatch
+):
+    """Unified periodic STT must not re-decode the full growing ring buffer."""
+    monkeypatch.setattr(settings, "STREAM_PARTIAL_WINDOW_MS", 3000)
+    ayah1 = quran_service.get_ayah(1, 1)["text"]
+    recognizer = MockSpeechRecognizer(transcript=ayah1)
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        threshold=0.5,
+        fail_policy="continue",
+        partials=True,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.on_audio_chunk(_pcm_tone(8000, amp=0.2))
+    session._last_periodic_at = 0.0
+    session.run_periodic_stt()
+    assert recognizer.calls == 1
+    # 3s @ 16 kHz = 48000 samples (allow small rounding).
+    assert recognizer.last_audio_samples == pytest.approx(48000, abs=160)
+    assert session.buffer.duration_ms == pytest.approx(8000, abs=20)
+
+
+def test_silence_short_reuses_fresh_last_stt(quran_service: QuranService):
+    """Breath pauses must not pay a second full-buffer Whisper."""
+    ayah1 = quran_service.get_ayah(1, 1)["text"]
+    partial = " ".join(ayah1.split()[:2])
+    recognizer = MockSpeechRecognizer(transcript=partial)
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        threshold=0.5,
+        fail_policy="continue",
+        partials=True,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.on_audio_chunk(_pcm_tone(1500, amp=0.2))
+    session._last_periodic_at = 0.0
+    session.run_periodic_stt()
+    assert recognizer.calls == 1
+    # One 250ms chunk of trailing silence/overlap — still reuse.
+    session.on_audio_chunk(_pcm_tone(200, amp=0.05))
+    events = session.run_assess(reason="silence_short")
+    assert recognizer.calls == 1  # reused last periodic decode
+    assert any(e.get("type") == "session.listening" for e in events)
+
+
+def test_silence_redecodes_when_buffer_grew_with_speech(
+    quran_service: QuranService,
+):
+    """New speech during STT must not finalize from a stale partial."""
+    ayah1 = quran_service.get_ayah(1, 1)["text"]
+    recognizer = MockSpeechRecognizer(
+        transcripts=[ayah1.split()[0], ayah1],
+    )
+    cfg = StreamSessionConfig(
+        start_surah=1,
+        start_ayah=1,
+        threshold=0.5,
+        fail_policy="continue",
+        partials=True,
+    )
+    session = StreamSession(quran_service, recognizer, cfg)
+    session.ready_event()
+    session.on_audio_chunk(_pcm_tone(2000, amp=0.2))
+    session._last_periodic_at = 0.0
+    session.run_periodic_stt()
+    assert recognizer.calls == 1
+    # Simulate more tilawah arriving while the previous decode was busy.
+    session.on_audio_chunk(_pcm_tone(2500, amp=0.2))
+    assert session.buffer.duration_ms > session._last_stt_buffer_ms + 250
+    events = session.run_assess(reason="silence")
     assert recognizer.calls == 2
+    assert any(e.get("type") == "ayah.result" for e in events)
 
 
 def test_session_partial_progress_uses_suffix_coverage(
