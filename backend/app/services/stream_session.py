@@ -118,9 +118,13 @@ class StreamSession:
         self._busy_count = 0
         self._stt_ms_total = 0
         self._last_stt: Transcription | None = None
+        self._last_stt_at = 0.0
+        self._last_stt_buffer_ms = 0
+        self._stt_buffer_ms_at_start = 0
         self._coverage_streak = 0
         self._stt_queued = False
         self._pending_assess: dict[str, Any] | None = None
+        self._last_periodic_audio_fp: tuple[int, int, int] | None = None
 
         self.buffer = PcmRingBuffer(
             sample_rate=config.sample_rate,
@@ -250,9 +254,58 @@ class StreamSession:
 
     def _reset_stream_decode_state(self) -> None:
         self._last_stt = None
+        self._last_stt_at = 0.0
+        self._last_stt_buffer_ms = 0
         self._coverage_streak = 0
         self._stt_queued = False
         self._pending_assess = None
+        self._last_periodic_audio_fp = None
+
+    def _remember_stt(
+        self,
+        transcription: Transcription,
+        *,
+        buffer_ms: int,
+    ) -> None:
+        self._last_stt = transcription
+        self._last_stt_at = time.monotonic()
+        self._last_stt_buffer_ms = max(0, int(buffer_ms))
+
+    def _reuse_last_stt_hint(
+        self,
+        reason: str,
+        audio_ms: int,
+        recognized_hint: str | None,
+    ) -> str | None:
+        """Reuse a prior decode only when the ring barely grew (silence tail).
+
+        Lab 2026-08-20: unconditional young-age reuse finalized with a stale
+        3s partial while the user kept speaking — last words were dropped
+        (all assesses reused, zero finalize Whisper, low coverage).
+        ~500–700ms of growth is still enough for 1–2 Arabic words, so the
+        silence-only slack is tight (~250ms / one PCM chunk).
+        """
+        silence_slack_ms = 250
+        if recognized_hint is not None:
+            # Coverage hints are the text from the decode that just finished;
+            # drop them when substantial new audio arrived after that snapshot.
+            growth = audio_ms - self._last_stt_buffer_ms
+            if growth > silence_slack_ms and reason in {
+                "silence",
+                "silence_short",
+                "coverage",
+            }:
+                return None
+            return recognized_hint
+        if self._last_stt is None:
+            return None
+        age = time.monotonic() - self._last_stt_at
+        if age > 3.0:
+            return None
+        growth = audio_ms - self._last_stt_buffer_ms
+        if growth <= silence_slack_ms:
+            return self._last_stt.text
+        return None
 
     def push_pending_assess(self, trigger: dict[str, Any]) -> None:
         """Keep the highest-priority pending finalize (latest wins ties)."""
@@ -272,9 +325,11 @@ class StreamSession:
         self._pending_assess = None
         if not job:
             return None
-        # Audio arrived while STT was busy — don't trust a stale coverage hint.
-        if job.get("reason") != "force" and self._stt_queued:
-            job = {**job, "recognized": None}
+        # New speech while STT was busy → finalize must re-decode the tail.
+        if job.get("reason") != "force" and job.get("recognized") is not None:
+            grown = int(self.buffer.duration_ms) - int(self._stt_buffer_ms_at_start)
+            if grown > 250:
+                job = {**job, "recognized": None}
         return job
 
     def has_stt_work(self) -> bool:
@@ -855,17 +910,43 @@ class StreamSession:
         want_partial = self.config.partials
         want_probe = settings.STREAM_COMPLETION_PROBE
 
-        # Partial-only arm (A2): cap window to last ~3s to keep CPU down.
-        if want_partial and not want_probe and not unified:
-            max_samples = int(self.config.sample_rate * 3.0)
-            if len(samples) > max_samples:
-                samples = samples[-max_samples:]
+        # Cap the inference window for every periodic tick (partial-only and
+        # unified). Without this, Whisper re-decodes the full growing ring
+        # buffer and live UI stalls for multi-second stt_busy stretches.
+        # Final ayah assess still uses the full buffer snapshot.
+        window_capped = False
+        raw_audio_ms = int(1000.0 * len(samples) / self.config.sample_rate)
+        window_ms = max(500, int(settings.STREAM_PARTIAL_WINDOW_MS))
+        max_samples = int(self.config.sample_rate * window_ms / 1000.0)
+        if len(samples) > max_samples:
+            samples = samples[-max_samples:]
+            window_capped = True
 
         if not self._pcm_has_stt_energy(samples):
             self._mark_periodic_emitted()
             return []
 
+        # Reuse last decode when the ring snapshot is unchanged (paused mic /
+        # trailing silence). Still run the coverage probe so stable-tick
+        # finalize can fire; do not re-emit partial UX or re-call Whisper.
+        # Lab 2026-08-20: identical 3 s PCM was re-transcribed ~20×.
+        audio_fp = (
+            int(samples.size),
+            int(round(float(np.max(np.abs(samples))) * 1_000_000)),
+            int(round(float(np.sum(np.square(samples))) * 1000)),
+        )
+        if (
+            audio_fp == self._last_periodic_audio_fp
+            and self._last_stt is not None
+        ):
+            self._mark_periodic_emitted()
+            if want_probe:
+                return self._coverage_probe_events(self._last_stt.text or "")
+            return []
+        self._last_periodic_audio_fp = audio_fp
+
         self.stt_busy = True
+        self._stt_buffer_ms_at_start = int(self.buffer.duration_ms)
         self._mark_periodic_emitted()
         t0 = time.perf_counter()
         try:
@@ -889,7 +970,7 @@ class StreamSession:
             self.stt_busy = False
 
         transcription = self._recover_heard(transcription)
-        self._last_stt = transcription
+        self._remember_stt(transcription, buffer_ms=raw_audio_ms)
         recognized = transcription.text or ""
 
         events: list[dict[str, Any]] = []
@@ -903,36 +984,44 @@ class StreamSession:
             )
 
         if want_probe:
-            expected = self.quran.get_ayah(self.current_surah, self.current_ayah)
-            coverage = 0.0
-            if expected and recognized:
-                expected_text = expected["text"]
-                if self._credit_enabled():
-                    merge = self._tentative_credit_merge(
-                        expected_text, recognized
-                    )
-                    coverage = (
-                        merge.cumulative_coverage if merge is not None else 0.0
-                    )
-                    if merge is not None and merge.complete:
-                        coverage = 1.0
-                else:
-                    assessor = MemorizationAssessor(threshold=self.config.threshold)
-                    coverage = assessor.progress(expected_text, recognized)
-            if expected and recognized and coverage >= settings.STREAM_COVERAGE_THRESHOLD:
-                self._coverage_streak += 1
-                needed = max(1, int(settings.STREAM_COVERAGE_STABLE_TICKS))
-                if self._coverage_streak >= needed:
-                    events.append(
-                        {
-                            "type": "_assess_trigger",
-                            "reason": "coverage",
-                            "recognized": recognized,
-                            "coverage": coverage,
-                        }
-                    )
+            events.extend(self._coverage_probe_events(recognized))
+        return events
+
+    def _coverage_probe_events(self, recognized: str) -> list[dict[str, Any]]:
+        """Advance coverage streak / emit assess trigger from a Heard string."""
+        events: list[dict[str, Any]] = []
+        expected = self.quran.get_ayah(self.current_surah, self.current_ayah)
+        coverage = 0.0
+        if expected and recognized:
+            expected_text = expected["text"]
+            if self._credit_enabled():
+                merge = self._tentative_credit_merge(expected_text, recognized)
+                coverage = (
+                    merge.cumulative_coverage if merge is not None else 0.0
+                )
+                if merge is not None and merge.complete:
+                    coverage = 1.0
             else:
-                self._coverage_streak = 0
+                assessor = MemorizationAssessor(threshold=self.config.threshold)
+                coverage = assessor.progress(expected_text, recognized)
+        if (
+            expected
+            and recognized
+            and coverage >= settings.STREAM_COVERAGE_THRESHOLD
+        ):
+            self._coverage_streak += 1
+            needed = max(1, int(settings.STREAM_COVERAGE_STABLE_TICKS))
+            if self._coverage_streak >= needed:
+                events.append(
+                    {
+                        "type": "_assess_trigger",
+                        "reason": "coverage",
+                        "recognized": recognized,
+                        "coverage": coverage,
+                    }
+                )
+        else:
+            self._coverage_streak = 0
         return events
 
     def should_probe_completion(self) -> bool:
@@ -1009,7 +1098,9 @@ class StreamSession:
         events: list[dict[str, Any]] = []
         audio_ms = int(1000.0 * len(samples) / self.config.sample_rate)
         transcription: Transcription | None = None
-
+        recognized_hint = self._reuse_last_stt_hint(
+            reason, audio_ms, recognized_hint
+        )
         if recognized_hint is not None:
             stt_ms = 0
             if self._last_stt is not None and self._last_stt.text == recognized_hint:
@@ -1020,6 +1111,10 @@ class StreamSession:
                 )
             recognized = (transcription.text if transcription else recognized_hint) or ""
         else:
+            # Full-buffer finalize. Live partials stay window-capped; a 4s
+            # assess cap after folding one partial dropped earlier words and
+            # scrambled endings (lab: infer=4000 + cov=0 on many ayah.result).
+            self._stt_buffer_ms_at_start = int(self.buffer.duration_ms)
             t0 = time.perf_counter()
             try:
                 transcription = self.recognizer.transcribe_audio_detailed(
@@ -1029,7 +1124,7 @@ class StreamSession:
                 )
                 transcription = self._recover_heard(transcription)
                 recognized = transcription.text or ""
-                self._last_stt = transcription
+                self._remember_stt(transcription, buffer_ms=audio_ms)
                 stt_ms = int((time.perf_counter() - t0) * 1000)
                 self._record_stt_ms(stt_ms)
             except Exception:

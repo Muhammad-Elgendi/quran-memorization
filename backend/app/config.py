@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     STREAM_SHORT_SILENCE_MS: int = 400
     STREAM_MIN_UTTERANCE_MS: int = 400
     STREAM_PARTIAL_EVERY_MS: int = 2000
+    # Periodic STT (partials + unified probe) only scores the last N ms so
+    # Whisper latency stays bounded while the ring buffer grows.
+    STREAM_PARTIAL_WINDOW_MS: int = 3000
     STREAM_COMPLETION_PROBE: bool = True
     STREAM_COMPLETION_PROBE_MS: int = 1000
     STREAM_COVERAGE_THRESHOLD: float = 0.85
@@ -60,9 +63,10 @@ class Settings(BaseSettings):
     STT_SEQUENCE_CONFIDENCE_MIN: float = 0.50
     STT_MAX_NEW_TOKENS: int = 64
     STT_PARTIAL_MAX_OVERGEN_RATIO: float = 2.0
-    # Decoder softmax → Accuracy slider. Lab 2026-08-14 (Moonshine Tiny) set
-    # 0.12; Whisper identity (1.0) is preferred after L5. Keep 0.12 until then.
-    STT_DECODER_PROB_GAMMA: float = 0.12
+    # Decoder softmax → Accuracy slider. Moonshine lab used 0.12; Whisper Tiny
+    # AR Quran L5 (2026-08-20): identity — gamma 0.12 inflated ~0.57 raw junk to
+    # ~0.94 and kept hallucinations as Heard.
+    STT_DECODER_PROB_GAMMA: float = 1.0
     # Ayah-constrained Heard recovery (Uthmani↔STT / agglutination / in-vocab revive).
     STT_AYAH_LEXICON_RECOVERY: bool = True
     STT_INVOCAB_FLOOR: float = 0.55

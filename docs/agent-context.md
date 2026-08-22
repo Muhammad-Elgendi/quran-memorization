@@ -7,7 +7,7 @@
 - Phase 2 stream: `specs/realtime-stream-spec.md`
 - Live STT: `specs/whisper-tiny-ar-quran-switch-spec.md`
 
-**Last updated:** 2026-08-16 (Tarteel Whisper Tiny AR Quran STT)
+**Last updated:** 2026-08-20 (Whisper gamma L5 + near-miss recovery; see `docs/whisper-stt-mishear-lab-2026-08-20.md`)
 
 ---
 
@@ -32,8 +32,8 @@ Local-first Quran memorization assessor:
 5. Auto-advance on pass; UI fail policies: **continue** | **stop** (server also supports `retry`).
 6. **Partials default ON** (`STREAM_PARTIALS_DEFAULT=true`) with unified completion probe (~1 s). Mid-utterance partials are **provisional** (UI does not lock red chips until `ayah.result`). Coverage auto-finalize needs `STREAM_COVERAGE_STABLE_TICKS` (default 2) consecutive high-coverage ticks.
 7. Vue mode toggle: Single ayah (REST) vs Continuous (WS).
-8. **STT confidence filter:** Whisper `generate(..., output_scores=True)` → drop Heard words with **calibrated** decoder *P* below Accuracy *T* (default 0.85). Decoder softmax is mapped with `p ** STT_DECODER_PROB_GAMMA` (0.12 until the Whisper L5 lab) first — raw *P* ≥ 0.85 emptied real Fatihah on Moonshine. Sequence confidence below 0.50 dumps the whole decode. `transcribe()` still returns the filtered string.
-9. **Ayah-constrained Heard recovery** (after the confidence filter): agglutinated STT tokens like `بسمالله` are split against consecutive expected ayah words; dropped in-vocab words with confidence ≥ `STT_INVOCAB_FLOOR` (0.55) are revived in decode order. Expected remains corpus Uthmani; comparison still goes through the normalizer. Does **not** invent words that never appeared in the decode.
+8. **STT confidence filter:** Whisper `generate(..., output_scores=True)` → drop Heard words with **calibrated** decoder *P* below Accuracy *T* (default 0.85). Decoder softmax is mapped with `p ** STT_DECODER_PROB_GAMMA` first (`1.0` for Whisper Tiny AR Quran after L5 2026-08-20; Moonshine had used `0.12`). Sequence confidence below 0.50 dumps the whole decode. `transcribe()` still returns the filtered string.
+9. **Ayah-constrained Heard recovery** (after the confidence filter): agglutinated STT tokens like `بسمالله` are split against consecutive expected ayah words; dropped in-vocab / **near-miss** (edit distance ≤ 1, min len ≥ 2) tokens are revived or rewritten onto the expected surface (`اسم`→`بسم`, `الر`→`الم`). Exact matches may revive below `STT_INVOCAB_FLOOR`; fuzzy revive still needs ≥ floor and ≥ 0.90 similarity. Expected remains corpus Uthmani; comparison still goes through the normalizer. Does **not** invent words that never appeared in the decode (except agglutination split / near-miss rewrite of an emitted token).
 10. **Energy gates (do not conflate):**
     - `STREAM_VAD_RMS_THRESHOLD` (0.015) — speech vs silence for utterance boundaries.
     - `STREAM_STT_RMS_THRESHOLD` (0.008) — whether periodic / auto STT is worth calling (quieter; AGC-off + denoise often sits under the VAD floor).
@@ -148,7 +148,7 @@ Implemented in `backend/app/services/normalizer.py`:
 - `passed = score >= threshold`; `warning = not passed`
 - Short phrases with one wrong word may still **pass** overall score at 0.85 while still listing `wrong_words` (spec scores overall ratio; UI shows mistakes)
 - **`progress()` / stream coverage gate** uses the **same** matched-token definition as alignment (exact `equal` **or** fuzzy replace ≥ word threshold), best over recognized suffixes. Do **not** revert coverage to exact-token-only — that stuck Continuous mode on Fatihah 1:2/1:4/1:6 when STT emitted simple Arabic vs Uthmani dagger-alef seats (`specs/ayah-advance-fix-spec.md`).
-- **Heard recovery** (`recover_against_ayah`) runs after the confidence filter and before `progress` / `assess` on REST and WS. A dropped `بسم` at conf 0.62 is revived; a Basmala that never decoded `بسم` stays at 75% coverage and does not auto-advance.
+- **Heard recovery** (`recover_against_ayah`) runs after the confidence filter and before `progress` / `assess` on REST and WS. A dropped `بسم` at conf 0.62 is revived; a near-miss `اسم`/`إسم` is rewritten to `بسم`; a Basmala that never decoded anything Basmala-like stays at 75% coverage and does not auto-advance.
 
 ### Follow-ups (not yet shipped)
 
@@ -309,6 +309,7 @@ cd backend && pytest -q
 | Continuous 1:3 live ~50%, `ٱلرَّحِيمِ` red, no advance (Single still passes) | Mid-utterance periodic STT + short-silence re-arm stalled long silence; UI treated provisional partial as hard fail | Stable coverage ticks (2); provisional chips; long silence → pass / fail / `session.listening` (cleared); audio kept while STT busy (`specs/continuous-vs-single-detection-spec.md`) |
 | Continuous “detection dead”: Score **0%**, Recognized empty, all words missing after Check now / pause | (1) Long-silence abandon cleared buffer; quiet leftover PCM failed `pcm_has_speech` at VAD floor; force scored empty as memorization fail. (2) Periodic STT used the same strict VAD RMS, so AGC-off/DTLN speech never transcribed | Force always STTs (≥ min utterance); empty Heard → `no_speech` + listening, not `ayah.result`; `STREAM_STT_RMS_THRESHOLD=0.008` for periodic/auto gates |
 | Continuous recites with mistakes, no warning tone | Coverage gate blocked `ayah.result` on incomplete takes; fresh `AudioContext` under live capture stayed silent / Single assess returned after mic teardown | Long silence + non-empty Heard scores a fail result; client **primes playback context on Start** (+ capture fallback), once-per-attempt (`specs/continuous-mistake-tone-spec.md`) |
+| Correct recitation misheard on first try; second try often OK | (1) Moonshine `STT_DECODER_PROB_GAMMA=0.12` inflated Whisper junk past Accuracy *T*. (2) Periodic STT re-decoded unchanged PCM ~20×. (3) Exact recovery missed Whisper near-misses (`اسم`/`الر`) | Gamma **1.0**; fingerprint reuse of `_last_stt` on unchanged audio; near-miss revive/rewrite in `recover_against_ayah` — full write-up: `docs/whisper-stt-mishear-lab-2026-08-20.md` |
 
 **Log signature for the WebM bug:**
 
@@ -359,6 +360,7 @@ After code changes with prod-like Compose: **rebuild images** (`--build`). Corpu
 ## 16. Pointers for later prompts
 
 - Prefer `@docs/agent-context.md` + `@implementation-spec.md` when changing product behavior.
+- Whisper Heard / gamma regressions: `@docs/whisper-stt-mishear-lab-2026-08-20.md` before retuning `STT_DECODER_PROB_GAMMA`.
 - Cursor rules under `.cursor/rules/` inject architecture, backend pitfalls, and Docker/K8s notes automatically.
 - Do not reintroduce naive index-zip assessment or mutate corpus text for matching.
 - Do not remove Fatihah repair, `NoDecode` on `CORS_ORIGINS`, or ffmpeg WebM conversion without an equivalent fix.

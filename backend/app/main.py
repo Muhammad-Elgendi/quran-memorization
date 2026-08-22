@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,6 +10,21 @@ from .config import QURAN_FILE, settings
 from .services.quran_service import QuranService
 from .services.speech_service import WhisperQuranRecognizer
 
+quran_service = QuranService(QURAN_FILE)
+# Share one recognizer instance so Whisper loads once for REST + WS.
+speech_recognizer = WhisperQuranRecognizer()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Load + warm Whisper before the first live partial (avoids ~12s cold generate).
+    try:
+        speech_recognizer._load()
+    except Exception:
+        pass
+    yield
+
+
 app = FastAPI(
     title=settings.APP_NAME,
     description=(
@@ -16,6 +33,7 @@ app = FastAPI(
         "REST /assess + WebSocket /stream."
     ),
     version="1.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -25,10 +43,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-quran_service = QuranService(QURAN_FILE)
-# Share one recognizer instance so Whisper loads once for REST + WS.
-speech_recognizer = WhisperQuranRecognizer()
 
 app.include_router(create_quran_router(quran_service))
 app.include_router(

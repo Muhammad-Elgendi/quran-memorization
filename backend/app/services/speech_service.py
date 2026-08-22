@@ -260,6 +260,13 @@ class WhisperQuranRecognizer(SpeechRecognizer):
         self._model = AutoModelForSpeechSeq2Seq.from_pretrained(self.model_name)
         self._model.eval()
         align_whisper_generation_config(self._model, self._processor)
+        # Pay torch/transformers first-generate cost at load, not on the user's
+        # first live partial (lab: cold 5s PCM → ~12s stt_ms; warm ~0.7s).
+        try:
+            warm = np.zeros(WHISPER_SAMPLE_RATE, dtype=np.float32)
+            self._transcribe_samples_detailed(warm, WHISPER_SAMPLE_RATE)
+        except Exception:
+            logger.exception("STT warmup failed model=%s", self.model_name)
 
         logger.info("STT loaded %s", self.model_name)
 
@@ -511,6 +518,8 @@ class MockSpeechRecognizer(SpeechRecognizer):
         self.sequence_confidence = sequence_confidence
         self.skipped_reason = skipped_reason
         self.calls = 0
+        self.last_audio_samples = 0
+        self.last_sample_rate = 16000
 
     def transcribe(
         self,
@@ -544,6 +553,8 @@ class MockSpeechRecognizer(SpeechRecognizer):
         *,
         threshold: float | None = None,
     ) -> Transcription:
+        self.last_audio_samples = int(np.asarray(samples).size)
+        self.last_sample_rate = int(sample_rate)
         return self._next_detailed(threshold=threshold)
 
     def _next_detailed(self, *, threshold: float | None = None) -> Transcription:

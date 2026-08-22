@@ -245,8 +245,10 @@ function recover_against_ayah(expected_uthmani: str, transcription: Transcriptio
 4. **In-vocab soft-keep (H1):**  
    Among `transcription.words` with `kept=false`, if `tokenize(word.text)` fuzzy-matches some unmatched `E[i]` at `≥ WORD_MATCH_THRESHOLD` **and** the match is consistent with sequence order (cannot skip backwards past an already-matched expected index), **revive** that word into the filtered text.  
    Cap: only revive words whose raw (pre-calibration optional) confidence is ≥ `STT_INVOCAB_FLOOR` (new setting, default **0.55**), so pure garbage still dies.  
+4b. **Near-miss rewrite (lab 2026-08-20):**  
+   Exact normalized match to `E[i]` may revive even below the invocab floor. If edit distance ≤ 1 (both sides length ≥ 2), rewrite the emitted surface onto the expected token (`اسم`→`بسم`, `الر`→`الم`). Do not treat long fuzzy hits (`الرسم`) as near-misses; fuzzy path still needs ≥ 0.90 + invocab floor. Near-miss skip-ahead only for short expected windows (≤ 2 tokens) so hallucination tails do not skip-match.  
 5. Rebuild `Transcription.text` from the recovered kept sequence (single spaces).  
-6. Do **not** invent tokens that never appeared in raw decode **except** via agglutination split of an emitted surface.
+6. Do **not** invent tokens that never appeared in raw decode **except** via agglutination split of an emitted surface **or** near-miss rewrite onto the matched expected token.
 
 **Why this matches `b897a11` spirit:** Heard remains STT-derived; the corpus only **constrains recovery**, it does not replace ASR with a forced lexicon dump of the whole ayah.
 
@@ -470,6 +472,7 @@ Do **not** consider L1/S1 satisfied by `MockSpeechRecognizer(transcript=uthmani_
 | Document / code | Relevance |
 |-----------------|-----------|
 | Screenshot 2026-08-14 20:15 | 1:1, 75%, dashed `بِسْمِ`, Heard without `بسم` |
+| `docs/whisper-stt-mishear-lab-2026-08-20.md` | Whisper gamma + near-miss + periodic reuse |
 | `b897a11ebfd763` | Working reference: assess(corpus, STT) via normalizer |
 | `backend/app/services/normalizer.py` | Uthmani→comparison folds; `بسم` already OK when present |
 | `backend/app/services/assessor.py` | Alignment + `progress` |

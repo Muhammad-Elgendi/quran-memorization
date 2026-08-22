@@ -544,5 +544,6 @@ Non-negotiables (unchanged wording, STT brand swapped):
 | Date | Note |
 |------|------|
 | 2026-08-16 | Spec v1.0: one-way switch to `tarteel-ai/whisper-tiny-ar-quran`; freeze product behavior; require Whisper generate shape, tail-30s clamp, special-token sanitizer (backend + Heard UI), gamma lab. |
+| 2026-08-20 | **L5 signed:** `STT_DECODER_PROB_GAMMA=1.0` (identity). Gamma 0.12 mapped Whisper raw ~0.57 junk to ~0.94 and polluted Heard; identity dumps junk. Soft correct tokens recovered via ayah near-miss path. Also: periodic STT reuses last decode when PCM fingerprint unchanged. Lab note: `docs/whisper-stt-mishear-lab-2026-08-20.md`. |
 
 *When implementing, prefer this file over leftover Moonshine strings in older specs.*
