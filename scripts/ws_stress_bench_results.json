@@ -1,0 +1,295 @@
+{
+  "started_at": "2026-08-22T22:33:43",
+  "finished_at": "2026-08-22T22:34:41",
+  "base_url": "http://127.0.0.1:8000",
+  "ws_url": "ws://127.0.0.1:8000/api/memorization/stream",
+  "scenarios": [
+    {
+      "name": "REST /health",
+      "ok": true,
+      "detail": "50 sequential GETs",
+      "metrics": {
+        "latency": {
+          "n": 50,
+          "unit": "ms",
+          "min": 1.52,
+          "mean": 1.94,
+          "p50": 1.8,
+          "p95": 2.17,
+          "p99": 5.71,
+          "max": 9.0
+        },
+        "errors": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "WS connect + session.ready (serial)",
+      "ok": true,
+      "detail": "20 serial sessions (partials=false)",
+      "metrics": {
+        "connect_latency": {
+          "n": 20,
+          "unit": "ms",
+          "min": 1.81,
+          "mean": 3.13,
+          "p50": 2.25,
+          "p95": 10.18,
+          "p99": 11.34,
+          "max": 11.63
+        },
+        "ready_latency": {
+          "n": 20,
+          "unit": "ms",
+          "min": 0.77,
+          "mean": 0.91,
+          "p50": 0.88,
+          "p95": 1.08,
+          "p99": 1.41,
+          "max": 1.49
+        },
+        "errors": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "WS ping/pong RTT",
+      "ok": true,
+      "detail": "200 pings on one live session",
+      "metrics": {
+        "rtt": {
+          "n": 200,
+          "unit": "ms",
+          "min": 0.18,
+          "mean": 0.25,
+          "p50": 0.24,
+          "p95": 0.37,
+          "p99": 0.44,
+          "max": 0.55
+        },
+        "errors": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "WS PCM ingest throughput",
+      "ok": true,
+      "detail": "8s realtime tone @ 250ms chunks",
+      "metrics": {
+        "bytes_sent": 256000,
+        "elapsed_s": 8.0,
+        "audio_bitrate_kbps": 256.0,
+        "send_latency": {
+          "n": 32,
+          "unit": "ms",
+          "min": 0.14,
+          "mean": 0.25,
+          "p50": 0.23,
+          "p95": 0.34,
+          "p99": 0.77,
+          "max": 0.96
+        },
+        "errors": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "WS concurrency ramp (find busy limit)",
+      "ok": true,
+      "detail": "probed 1..6; first busy at None",
+      "metrics": {
+        "first_busy_at_clients": null,
+        "curve": [
+          {
+            "clients": 1,
+            "accepted": 1,
+            "busy": 0,
+            "failed": 0
+          },
+          {
+            "clients": 2,
+            "accepted": 2,
+            "busy": 0,
+            "failed": 0
+          },
+          {
+            "clients": 3,
+            "accepted": 2,
+            "busy": 0,
+            "failed": 1
+          },
+          {
+            "clients": 4,
+            "accepted": 2,
+            "busy": 0,
+            "failed": 2
+          },
+          {
+            "clients": 5,
+            "accepted": 2,
+            "busy": 0,
+            "failed": 3
+          },
+          {
+            "clients": 6,
+            "accepted": 2,
+            "busy": 0,
+            "failed": 4
+          }
+        ]
+      },
+      "errors": []
+    },
+    {
+      "name": "WS concurrent sessions \u00d72",
+      "ok": true,
+      "detail": "simultaneous connect+start, hold 4s; accepted=2 busy=0 failed=0",
+      "metrics": {
+        "wall_ms": 4027.25,
+        "accepted": 2,
+        "busy_rejected": 0,
+        "failed": 0,
+        "ready_latency_accepted": {
+          "n": 2,
+          "unit": "ms",
+          "min": 0.55,
+          "mean": 0.67,
+          "p50": 0.67,
+          "p95": 0.77,
+          "p99": 0.78,
+          "max": 0.78
+        },
+        "sample_errors": []
+      },
+      "errors": []
+    },
+    {
+      "name": "WS concurrent sessions \u00d72 +audio",
+      "ok": true,
+      "detail": "simultaneous connect+start, hold 4s; accepted=2 busy=0 failed=0",
+      "metrics": {
+        "wall_ms": 4209.22,
+        "accepted": 2,
+        "busy_rejected": 0,
+        "failed": 0,
+        "ready_latency_accepted": {
+          "n": 2,
+          "unit": "ms",
+          "min": 0.92,
+          "mean": 2.25,
+          "p50": 2.25,
+          "p95": 3.46,
+          "p99": 3.56,
+          "max": 3.59
+        },
+        "sample_errors": []
+      },
+      "errors": []
+    },
+    {
+      "name": "WS concurrent sessions \u00d74",
+      "ok": false,
+      "detail": "simultaneous connect+start, hold 4s; accepted=2 busy=0 failed=2",
+      "metrics": {
+        "wall_ms": 4045.4,
+        "accepted": 2,
+        "busy_rejected": 0,
+        "failed": 2,
+        "ready_latency_accepted": {
+          "n": 2,
+          "unit": "ms",
+          "min": 3.19,
+          "mean": 3.93,
+          "p50": 3.93,
+          "p95": 4.61,
+          "p99": 4.67,
+          "max": 4.68
+        },
+        "sample_errors": [
+          "closed 1013 ",
+          "closed 1013 "
+        ]
+      },
+      "errors": [
+        "closed 1013 ",
+        "closed 1013 "
+      ]
+    },
+    {
+      "name": "WS concurrent sessions \u00d78",
+      "ok": false,
+      "detail": "simultaneous connect+start, hold 4s; accepted=2 busy=0 failed=6",
+      "metrics": {
+        "wall_ms": 4037.36,
+        "accepted": 2,
+        "busy_rejected": 0,
+        "failed": 6,
+        "ready_latency_accepted": {
+          "n": 2,
+          "unit": "ms",
+          "min": 1.18,
+          "mean": 4.25,
+          "p50": 4.25,
+          "p95": 7.02,
+          "p99": 7.27,
+          "max": 7.33
+        },
+        "sample_errors": [
+          "closed 1013 ",
+          "closed 1013 ",
+          "closed 1013 ",
+          "closed 1013 ",
+          "closed 1013 "
+        ]
+      },
+      "errors": [
+        "closed 1013 ",
+        "closed 1013 ",
+        "closed 1013 ",
+        "closed 1013 ",
+        "closed 1013 "
+      ]
+    },
+    {
+      "name": "WS force_assess (STT) latency",
+      "ok": true,
+      "detail": "6 serial force_assess with ~1.5s PCM tone (real Whisper)",
+      "metrics": {
+        "force_assess_to_result": {
+          "n": 6,
+          "unit": "ms",
+          "min": 557.84,
+          "mean": 799.91,
+          "p50": 756.33,
+          "p95": 1049.9,
+          "p99": 1072.18,
+          "max": 1077.75
+        },
+        "errors": 0
+      },
+      "errors": []
+    },
+    {
+      "name": "REST /assess (STT) latency",
+      "ok": true,
+      "detail": "4 serial multipart assessments with 1.5s WAV tone",
+      "metrics": {
+        "latency": {
+          "n": 4,
+          "unit": "ms",
+          "min": 758.14,
+          "mean": 1364.93,
+          "p50": 1476.61,
+          "p95": 1725.07,
+          "p99": 1743.69,
+          "max": 1748.34
+        },
+        "status_codes": {
+          "200": 4
+        },
+        "errors": 0
+      },
+      "errors": []
+    }
+  ]
+}

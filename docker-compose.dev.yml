@@ -22,6 +22,7 @@ services:
       - "8000:8000"
     environment:
       CORS_ORIGINS: "*"
+      STREAM_MAX_CONCURRENT_SESSIONS: "8"
       HF_HOME: /models/huggingface
       HF_HUB_CACHE: /models/huggingface/hub
     volumes:

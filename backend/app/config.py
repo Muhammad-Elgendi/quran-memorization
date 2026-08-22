@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     STREAM_MAX_SESSION_S: int = 1800
     STREAM_MAX_BUFFER_S: float = 45.0
     STREAM_MAX_FRAME_BYTES: int = 256 * 1024
-    STREAM_MAX_CONCURRENT_SESSIONS: int = 2
+    STREAM_MAX_CONCURRENT_SESSIONS: int = 8
     STREAM_PARTIALS_DEFAULT: bool = True
     STREAM_VAD_RMS_THRESHOLD: float = 0.015
     # STT energy gate (periodic + auto-assess). Lower than VAD so quiet mics

@@ -30,6 +30,7 @@ services:
       MAX_AUDIO_SECONDS: "20.0"
       STT_MODEL: "tarteel-ai/whisper-tiny-ar-quran"
       CORS_ORIGINS: "*"
+      STREAM_MAX_CONCURRENT_SESSIONS: "8"
       HF_HOME: /models/huggingface
       HF_HUB_CACHE: /models/huggingface/hub
     volumes:

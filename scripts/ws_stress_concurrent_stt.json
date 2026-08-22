@@ -1,0 +1,37 @@
+{
+  "name": "concurrent_force_assess_x2",
+  "wall_ms": 6667.16,
+  "client_a": {
+    "id": 0,
+    "lats": [
+      1317.11,
+      1567.72,
+      1985.49
+    ],
+    "types": [
+      "ayah.result",
+      "ayah.result",
+      "ayah.result"
+    ]
+  },
+  "client_b": {
+    "id": 1,
+    "lats": [
+      1345.43,
+      1590.56,
+      2032.93
+    ],
+    "types": [
+      "ayah.result",
+      "ayah.result",
+      "ayah.result"
+    ]
+  },
+  "combined": {
+    "n": 6,
+    "mean": 1639.87,
+    "p50": 1579.14,
+    "max": 2032.93,
+    "min": 1317.11
+  }
+}
